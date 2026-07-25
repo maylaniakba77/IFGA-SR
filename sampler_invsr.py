@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 from loguru import logger
 from omegaconf import OmegaConf
+from fga_integration.patch_decoder import inject_fga
 
 from utils import util_net
 from utils import util_image
@@ -107,6 +108,8 @@ class BaseSampler:
         setattr(sd_pipe, 'start_noise_predictor', model_start)
 
         self.sd_pipe = sd_pipe
+
+        inject_fga(sd_pipe.vae, mode=self.configs.get("fga_mode", "none"))
 
 class InvSamplerSR(BaseSampler):
     @torch.no_grad()
