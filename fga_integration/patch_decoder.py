@@ -1,3 +1,5 @@
+from fga_integration.fga_upsampler import FGAUpsample2D
+
 def inject_fga(vae, mode="partial", inner_dim=64):
     """mode: 'none' (baseline) | 'partial' | 'full'"""
     if mode == "none":
