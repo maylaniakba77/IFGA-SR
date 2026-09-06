@@ -19,5 +19,9 @@ class FGAUpsample2D(nn.Module):
 
     def forward(self, hidden_states, output_size=None, *args, **kwargs):
         base  = self.orig(hidden_states, output_size, *args, **kwargs)
-        delta = self.fga(hidden_states)
-        return base + delta                              # residual
+        # Jalur bawaan boleh fp16 (inferensi InvSR), tetapi FGA dilatih di float32
+        # dan softmax attention + LayerNorm-nya tidak stabil di half precision.
+        # Konversi di batas modul: masuk ikut dtype FGA, keluar ikut dtype base.
+        fga_dtype = next(self.fga.parameters()).dtype
+        delta = self.fga(hidden_states.to(fga_dtype))
+        return base + delta.to(base.dtype)               # residual
