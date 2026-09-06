@@ -109,7 +109,35 @@ class BaseSampler:
 
         self.sd_pipe = sd_pipe
 
-        inject_fga(sd_pipe.vae, mode=self.configs.get("fga_mode", "none"))
+        fga_mode = self.configs.get("fga_mode", "none")
+        if fga_mode == "none":
+            inject_fga(sd_pipe.vae, mode="none")
+        else:
+            fga_ckpt = self.configs.get("fga_ckpt", None)
+            assert fga_ckpt is not None, (
+                f"fga_mode={fga_mode} but fga_ckpt is not set. Without the trained weights "
+                "the zero-initialised unembed makes output bit-identical to baseline."
+            )
+            ckpt = torch.load(fga_ckpt, map_location="cuda")
+            assert ckpt["mode"] == fga_mode, (
+                f"Checkpoint mode={ckpt['mode']} does not match config fga_mode={fga_mode}"
+            )
+            # inner_dim must come from the checkpoint: a mismatch would silently
+            # produce shape errors, or worse, non-overlapping keys.
+            inject_fga(sd_pipe.vae, mode=fga_mode,
+                       inner_dim=ckpt.get("inner_dim", 64))
+            missing, unexpected = sd_pipe.vae.load_state_dict(
+                ckpt["state_dict"], strict=False
+            )
+            assert not unexpected, f"Unexpected keys in FGA checkpoint: {unexpected}"
+            still_missing = [k for k in missing if ".fga." in k]
+            assert not still_missing, (
+                f"FGA keys not populated by the checkpoint: {still_missing[:5]}"
+            )
+            self.write_log(
+                f"Loaded FGA weights ({fga_mode}, inner_dim={ckpt.get('inner_dim', 64)}, "
+                f"step={ckpt.get('step')}) from {fga_ckpt}"
+            )
 
 class InvSamplerSR(BaseSampler):
     @torch.no_grad()

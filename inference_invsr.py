@@ -41,6 +41,13 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--chopping_size", type=int, default=128, help="Chopping size when dealing large images"
     )
+    parser.add_argument(
+        "--fga_mode", type=str, default="", choices=["none", "partial", "full"],
+        help="FGA injection mode. Overrides fga_mode in the config.",
+    )
+    parser.add_argument(
+        "--fga_ckpt", type=str, default="", help="Trained FGA checkpoint (.pth)",
+    )
     args = parser.parse_args()
 
     return args
@@ -90,6 +97,12 @@ def get_configs(args):
                 file_name=started_ckpt_name,
             )
     configs.model_start.ckpt_path = str(started_ckpt_path)
+
+    # FGA: CLI wins over the YAML, so one config serves baseline and both variants.
+    if args.fga_mode:
+        configs.fga_mode = args.fga_mode
+    if args.fga_ckpt:
+        configs.fga_ckpt = args.fga_ckpt
 
     configs.bs = args.bs
     configs.tiled_vae = args.tiled_vae
