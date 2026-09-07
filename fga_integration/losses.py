@@ -5,9 +5,26 @@ pada blok upsampling decoder VAE InvSR.
     L_total = w_pixel * L_pixel + w_freq * L_frequency [+ w_lpips * L_LPIPS]
 
 - L_pixel     : L1 (default) atau L2 pada ruang piksel terhadap ground-truth HR.
-- L_frequency : L1 pada domain frekuensi (magnitudo selisih FFT-2D kompleks),
-                mengikuti rumusan frequency-domain L1 loss pada FGA-SR.
+- L_frequency : bergantung `freq_mode`:
+                  'full'      L1 pada selisih FFT-2D KOMPLEKS (seluruh spektrum)
+                  'highpass'  sama, tetapi dibatasi band frekuensi tinggi
+                  'magnitude' L1 pada selisih MAGNITUDO spektrum band tinggi
 - L_LPIPS     : opsional (default nonaktif), metrik persepsi berbasis deep feature.
+
+PERINGATAN PENTING SOAL 'full' DAN 'highpass'
+    Keduanya menghitung selisih bilangan KOMPLEKS pada basis `norm="ortho"`.
+    rFFT ortonormal adalah transformasi uniter, sehingga (teorema Parseval) jarak
+    di domain frekuensi ekuivalen dengan jarak di domain piksel — term ini BUKAN
+    sinyal supervisi baru, hanya loss fidelitas yang sama dalam basis terotasi.
+    Konsekuensinya ia SENSITIF FASE: tekstur yang benar secara statistik tetapi
+    bergeser beberapa piksel dihukum berat, persis seperti L1 piksel. Arah
+    gradiennya karena itu "hilangkan detail yang tidak sejajar", bukan "tambahkan
+    detail" — hasil pelatihan menjadi lebih halus dari baseline.
+
+    'magnitude' mencocokkan ENERGI spektrum tanpa mewajibkan kecocokan fase, jadi
+    arah gradiennya "samakan kekayaan detail". Inilah varian yang dipakai bila
+    tujuannya ketajaman. Pertahankan 'full'/'highpass' hanya sebagai kondisi
+    pembanding pada studi ablasi.
 
 CATATAN RENTANG NILAI
     `pred` dan `target` HARUS berada pada rentang yang sama.
@@ -81,6 +98,51 @@ def frequency_l1_loss_highpass(
     return mag.sum() / denom
 
 
+def spectral_magnitude_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cutoff: float = 0.25,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """L1 pada selisih MAGNITUDO spektrum, dibatasi band frekuensi tinggi.
+
+    Berbeda dari `frequency_l1_loss*`, di sini fase dibuang lebih dulu lewat
+    `.abs()`. Yang disupervisi adalah seberapa besar energi yang dimiliki tiap
+    frekuensi, bukan di mana persisnya detail itu berada.
+
+    Mengapa ini yang mendorong ketajaman: latent InvSR bersifat generatif, jadi
+    detail frekuensi tingginya plausibel tetapi tidak sejajar piksel dengan GT.
+    Loss yang sensitif fase hanya bisa menurunkan error dengan MEREDAM detail
+    tersebut — meredam selalu aman baginya. Loss magnitudo tidak: begitu energi
+    band tinggi turun di bawah GT, loss NAIK. Jadi penghalusan tidak lagi
+    menjadi jalan keluar yang murah.
+
+    Perhatikan bahwa loss ini SIMETRIS — energi yang berlebih dihukum sama
+    beratnya dengan yang kurang. Itu memang disengaja: ia menjaga spektrum
+    keluaran tetap menyerupai citra natural, bukan mendorongnya menuju noise.
+
+    Args:
+        cutoff: batas bawah band yang disupervisi, sebagai fraksi frekuensi
+                Nyquist (0.25 = hanya frekuensi di atas 25% Nyquist).
+    """
+    pred_f = torch.fft.rfft2(pred.float(), norm="ortho")
+    tgt_f = torch.fft.rfft2(target.float(), norm="ortho")
+
+    fy = torch.fft.fftfreq(pred.shape[-2], device=pred.device).abs()
+    fx = torch.fft.rfftfreq(pred.shape[-1], device=pred.device).abs()
+    # cutoff * 0.5: fftfreq bersatuan cycles/sample pada [0, 0.5], sehingga
+    # Nyquist = 0.5. Konvensi ini identik dengan frequency_l1_loss_highpass,
+    # karena keduanya dibaca dari flag --freq_cutoff yang sama.
+    mask = ((fy[:, None] > cutoff * 0.5) | (fx[None, :] > cutoff * 0.5)).float()[None, None]
+
+    # .abs() pada spektrum -> magnitudo; selisihnya tidak lagi bergantung fase.
+    # eps menjaga gradien sqrt di dalam abs() tetap terdefinisi pada nol.
+    diff = (torch.sqrt(pred_f.real.pow(2) + pred_f.imag.pow(2) + eps)
+            - torch.sqrt(tgt_f.real.pow(2) + tgt_f.imag.pow(2) + eps)).abs() * mask
+    denom = mask.sum().clamp(min=1.0) * pred.shape[0] * pred.shape[1]
+    return diff.sum() / denom
+
+
 # --------------------------------------------------------------------------- #
 # Combined loss module
 # --------------------------------------------------------------------------- #
@@ -92,7 +154,7 @@ class FGALoss(nn.Module):
         w_pixel    : bobot komponen piksel
         w_freq     : bobot komponen domain-frekuensi
         w_lpips    : bobot LPIPS (0.0 = nonaktif, tidak memuat model LPIPS)
-        freq_mode  : 'full' | 'highpass'
+        freq_mode  : 'full' | 'highpass' | 'magnitude'
         freq_cutoff: cutoff untuk freq_mode='highpass'
         lpips_net  : backbone LPIPS ('alex' lebih ringan, 'vgg' lebih standar)
     """
@@ -109,7 +171,8 @@ class FGALoss(nn.Module):
     ):
         super().__init__()
         assert pixel_type in ("l1", "l2"), f"pixel_type tidak dikenal: {pixel_type}"
-        assert freq_mode in ("full", "highpass"), f"freq_mode tidak dikenal: {freq_mode}"
+        assert freq_mode in ("full", "highpass", "magnitude"), \
+            f"freq_mode tidak dikenal: {freq_mode}"
 
         self.pixel_type = pixel_type
         self.w_pixel = w_pixel
@@ -151,8 +214,10 @@ class FGALoss(nn.Module):
 
         if self.freq_mode == "full":
             l_freq = frequency_l1_loss(pred, target)
-        else:
+        elif self.freq_mode == "highpass":
             l_freq = frequency_l1_loss_highpass(pred, target, cutoff=self.freq_cutoff)
+        else:
+            l_freq = spectral_magnitude_loss(pred, target, cutoff=self.freq_cutoff)
 
         total = self.w_pixel * l_pix + self.w_freq * l_freq
         parts = {

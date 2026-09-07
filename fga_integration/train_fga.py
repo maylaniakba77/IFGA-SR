@@ -59,7 +59,8 @@ class LatentHRDataset(Dataset):
         └── gt/      <nama>.npy   (3, H, W)  float16, rentang [0, 1]
     """
 
-    def __init__(self, data_dir: str, split: str = "train", val_size: int = 32):
+    def __init__(self, data_dir: str, split: str = "train", val_size: int = 32,
+                 crop: int = 0):
         root = Path(data_dir)
         names = sorted(p.stem for p in (root / "latent").glob("*.npy"))
         if len(names) == 0:
@@ -70,9 +71,42 @@ class LatentHRDataset(Dataset):
         self.names = names[val_size:] if split == "train" else names[:val_size]
         self.root = root
         self.split = split
+        # crop dinyatakan dalam piksel HR; 0 = nonaktif (perilaku lama)
+        if crop and crop % 8 != 0:
+            raise ValueError(f"--crop {crop} harus habis dibagi 8 (rasio latent:HR)")
+        self.crop = crop
 
     def __len__(self) -> int:
         return len(self.names)
+
+    def _crop(self, latent: torch.Tensor, gt: torch.Tensor):
+        """Crop berpasangan pada latent dan GT.
+
+        Crop dilakukan di ruang LATENT lalu dicerminkan ke GT dengan faktor
+        `ratio`, sehingga keduanya menunjuk wilayah citra yang sama. Konsekuensi
+        yang perlu disadari: decoder melihat tepi baru di batas crop, jadi
+        piksel tepi tidak identik dengan hasil decode citra penuh. Ini praktik
+        standar untuk pelatihan di ruang latent dan hanya berpengaruh pada
+        beberapa piksel pinggir — tetapi jangan pakai crop terlalu kecil.
+        """
+        _, lh, lw = latent.shape
+        ratio = gt.shape[-2] // lh
+        assert ratio * lh == gt.shape[-2] and ratio * lw == gt.shape[-1], (
+            f"latent {tuple(latent.shape)} dan gt {tuple(gt.shape)} tidak sebanding"
+        )
+        cl = self.crop // ratio
+        if cl <= 0 or cl >= lh or cl >= lw:
+            return latent, gt  # citra sudah lebih kecil dari crop: lewati
+
+        if self.split == "train":
+            y = int(torch.randint(0, lh - cl + 1, (1,)).item())
+            x = int(torch.randint(0, lw - cl + 1, (1,)).item())
+        else:
+            y, x = (lh - cl) // 2, (lw - cl) // 2  # center crop: val harus deterministik
+
+        latent = latent[:, y:y + cl, x:x + cl]
+        gt = gt[:, y * ratio:(y + cl) * ratio, x * ratio:(x + cl) * ratio]
+        return latent, gt
 
     def __getitem__(self, idx: int):
         name = self.names[idx]
@@ -82,6 +116,8 @@ class LatentHRDataset(Dataset):
         latent = torch.from_numpy(latent)
         # [0, 1] -> [-1, 1] agar sepadan dengan keluaran vae.decode(...).sample
         gt = torch.from_numpy(gt) * 2.0 - 1.0
+        if self.crop:
+            latent, gt = self._crop(latent, gt)
         return latent, gt
 
 
@@ -95,9 +131,11 @@ def infinite(loader):
 # Evaluasi ringkas saat pelatihan
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(vae, loader, criterion, scaling_factor, device, amp_dtype):
+def evaluate(vae, loader, criterion, scaling_factor, device, amp_dtype, lpips_model=None):
     vae.eval()
     tot = {"loss_total": 0.0, "psnr": 0.0, "spec": 0.0}
+    if lpips_model is not None:
+        tot["lpips"] = 0.0
     n = 0
     for latent, gt in loader:
         latent, gt = latent.to(device), gt.to(device)
@@ -108,6 +146,9 @@ def evaluate(vae, loader, criterion, scaling_factor, device, amp_dtype):
         tot["loss_total"] += parts["loss_total"]
         tot["psnr"] += psnr(rec, gt)
         tot["spec"] += spectral_consistency(rec, gt)
+        if lpips_model is not None:
+            # LPIPS mengharapkan [-1, 1], sama dengan keluaran decode
+            tot["lpips"] += float(lpips_model(rec, gt).mean())
         n += 1
     vae.train()
     return {k: v / max(n, 1) for k, v in tot.items()}
@@ -121,6 +162,9 @@ def main():
     # data
     ap.add_argument("--data_dir", type=str, required=True, help="hasil cache_latents.py")
     ap.add_argument("--val_size", type=int, default=32)
+    ap.add_argument("--crop", type=int, default=0,
+                    help="crop acak dalam piksel HR (harus kelipatan 8); 0 = citra penuh. "
+                         "Dengan crop seragam, --batch > 1 menjadi legal")
     # model
     ap.add_argument("--sd_path", type=str, default="stabilityai/sd-turbo")
     ap.add_argument("--mode", type=str, default="partial", choices=["partial", "full"])
@@ -139,7 +183,18 @@ def main():
     ap.add_argument("--w_pixel", type=float, default=1.0)
     ap.add_argument("--w_freq", type=float, default=0.1)
     ap.add_argument("--w_lpips", type=float, default=0.0)
-    ap.add_argument("--freq_mode", type=str, default="full", choices=["full", "highpass"])
+    ap.add_argument("--freq_mode", type=str, default="full",
+                    choices=["full", "highpass", "magnitude"],
+                    help="'full'/'highpass' sensitif fase sehingga mendorong penghalusan; "
+                         "'magnitude' mencocokkan energi spektrum dan mendorong ketajaman")
+    ap.add_argument("--freq_cutoff", type=float, default=0.25,
+                    help="batas band untuk freq_mode 'highpass' / 'magnitude'")
+    ap.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg"])
+    ap.add_argument("--select_by", type=str, default="psnr",
+                    choices=["psnr", "lpips", "loss"],
+                    help="metrik validasi pemilih checkpoint terbaik. 'psnr' memilih model "
+                         "TERBLUR (estimator MMSE); pakai 'lpips' bila target akhirnya "
+                         "ketajaman perseptual")
     # logging & checkpoint
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--log_every", type=int, default=50)
@@ -183,9 +238,10 @@ def main():
     print(f"[model] vae.config.scaling_factor = {scaling_factor}")
 
     # ------------------------------------------------------------------ data
-    ds_tr = LatentHRDataset(args.data_dir, "train", args.val_size)
-    ds_va = LatentHRDataset(args.data_dir, "val", args.val_size)
-    print(f"[data] train={len(ds_tr)} | val={len(ds_va)}")
+    ds_tr = LatentHRDataset(args.data_dir, "train", args.val_size, crop=args.crop)
+    ds_va = LatentHRDataset(args.data_dir, "val", args.val_size, crop=args.crop)
+    print(f"[data] train={len(ds_tr)} | val={len(ds_va)} | "
+          f"crop={args.crop or 'nonaktif (citra penuh)'}")
 
     dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True,
                        num_workers=2, pin_memory=True, drop_last=True)
@@ -199,7 +255,36 @@ def main():
         w_freq=args.w_freq,
         w_lpips=args.w_lpips,
         freq_mode=args.freq_mode,
+        freq_cutoff=args.freq_cutoff,
+        lpips_net=args.lpips_net,
     ).to(device)
+
+    # LPIPS untuk validasi. Bila sudah ada di dalam loss, pakai model yang sama;
+    # bila tidak, muat satu khusus evaluasi supaya --select_by lpips tetap bisa
+    # dipakai tanpa mengubah komposisi loss (penting untuk ablasi yang terkontrol).
+    val_lpips = criterion.lpips
+    if args.select_by == "lpips" and val_lpips is None:
+        try:
+            import lpips as _lpips
+        except ImportError as e:
+            raise ImportError(
+                "--select_by lpips memerlukan paket `lpips`. Jalankan: pip install lpips"
+            ) from e
+        val_lpips = _lpips.LPIPS(net=args.lpips_net).to(device).eval()
+        for prm in val_lpips.parameters():
+            prm.requires_grad_(False)
+        print("[loss] LPIPS dimuat khusus untuk validasi (tidak masuk ke loss)")
+
+    if args.freq_mode != "magnitude" and args.w_freq > 0:
+        print("[loss] PERINGATAN: freq_mode="
+              f"{args.freq_mode} menghitung selisih FFT KOMPLEKS. Basis ortonormal "
+              "membuatnya ekuivalen dengan loss piksel (Parseval) dan sensitif fase, "
+              "jadi ia MENDORONG PENGHALUSAN, bukan ketajaman. Pakai "
+              "--freq_mode magnitude bila targetnya menambah detail.")
+    if args.select_by == "psnr":
+        print("[ckpt] PERINGATAN: --select_by psnr memilih checkpoint dengan error "
+              "kuadrat terkecil, yaitu varian paling halus. Pakai --select_by lpips "
+              "bila keluaran yang diinginkan lebih tajam.")
 
     # ------------------------------------------------------------- optimizer
     # AdamW: weight decay ter-decouple, membantu regularisasi modul kecil pada
@@ -216,7 +301,12 @@ def main():
         return args.lr * 0.5 * (1 + math.cos(math.pi * prog))  # cosine decay
 
     # --------------------------------------------------------------- training
-    history, best_psnr, t0 = [], -1e9, time.time()
+    # Arah optimalitas tiap metrik pemilih: PSNR makin besar makin baik,
+    # LPIPS dan loss makin kecil makin baik.
+    SELECT = {"psnr": ("psnr", 1.0), "lpips": ("lpips", -1.0), "loss": ("loss_total", -1.0)}
+    sel_key, sel_sign = SELECT[args.select_by]
+
+    history, best_score, t0 = [], -1e9, time.time()
 
     for step in range(args.iters):
         for g in opt.param_groups:
@@ -253,14 +343,19 @@ def main():
             history.append({"step": step + 1, "lr": lr_at(step), **acc})
 
         if (step + 1) % args.val_every == 0:
-            m = evaluate(vae, dl_va, criterion, scaling_factor, device, amp_dtype)
-            print(f"    -> VAL loss={m['loss_total']:.5f} "
-                  f"psnr={m['psnr']:.3f} dB spec={m['spec']:.4f}")
+            m = evaluate(vae, dl_va, criterion, scaling_factor, device, amp_dtype, val_lpips)
+            msg = (f"    -> VAL loss={m['loss_total']:.5f} "
+                   f"psnr={m['psnr']:.3f} dB spec={m['spec']:.4f}")
+            if "lpips" in m:
+                msg += f" lpips={m['lpips']:.4f}"
+            print(msg)
             history.append({"step": step + 1, "val": m})
-            if m["psnr"] > best_psnr:
-                best_psnr = m["psnr"]
+            score = sel_sign * m[sel_key]
+            if score > best_score:
+                best_score = score
                 save_fga(vae, out_dir / f"fga_{args.mode}_best.pth", args, step + 1, m)
-                print(f"    -> checkpoint terbaik disimpan (PSNR {best_psnr:.3f} dB)")
+                print(f"    -> checkpoint terbaik disimpan "
+                      f"({args.select_by}={m[sel_key]:.4f})")
 
         if (step + 1) % args.save_every == 0:
             save_fga(vae, out_dir / f"fga_{args.mode}_last.pth", args, step + 1, None)
@@ -268,7 +363,8 @@ def main():
 
     save_fga(vae, out_dir / f"fga_{args.mode}_final.pth", args, args.iters, None)
     (out_dir / "history.json").write_text(json.dumps(history, indent=2))
-    print(f"[selesai] {(time.time() - t0) / 60:.1f} menit | PSNR val terbaik = {best_psnr:.3f} dB")
+    print(f"[selesai] {(time.time() - t0) / 60:.1f} menit | "
+          f"{args.select_by} val terbaik = {sel_sign * best_score:.4f}")
 
 
 def save_fga(vae, path: Path, args, step: int, metrics) -> None:
