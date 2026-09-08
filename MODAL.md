@@ -492,6 +492,25 @@ kecil.
 > dan `full`. Melatih satu varian di A100 batch 4 dan satunya di L4 batch 1
 > membuat perbandingan H3 terkonfound, meski batch efektifnya sama.
 
+### Flag yang tersedia di `train`
+
+Setiap argumen loss `train_fga.py` diteruskan oleh fungsi Modal, dengan garis
+bawah menjadi tanda hubung:
+
+| Modal CLI | default | keterangan |
+|---|---|---|
+| `--w-pixel` | 1.0 | penyumbang utama tarikan ke arah blur; turunkan ke 0.1 |
+| `--w-freq` | 1.0 | bobot term frekuensi |
+| `--w-lpips` | 0.5 | bobot LPIPS |
+| `--lpips-net` | alex | **pakai `vgg`** — alex terpuaskan oleh penghalusan |
+| `--freq-mode` | magnitude | `full` \| `highpass` \| `magnitude` |
+| `--freq-cutoff` | 0.25 | batas band, fraksi Nyquist |
+| `--pixel-type` | l1 | `l1` \| `l2` |
+| `--select-by` | lpips | `psnr` \| `lpips` \| `loss` |
+| `--lr` `--amp` `--seed` `--val-size` | 1e-4, bf16, 123456, 32 | |
+| `--crop` `--batch` `--accum` `--inner-dim` | 256, 1, 4, 64 | |
+| `--log-every` `--val-every` | 50, 500 | turunkan untuk smoke test |
+
 ### Kalibrasi `w_freq`
 
 Skala `magnitude` berbeda dari `full`, jadi `w_freq=0.1` terlalu lemah untuk
@@ -602,6 +621,42 @@ Config yang sama juga menyalakan `tiled_vae: True` dengan
 mengevaluasi citra > 1024 px, decoder berjalan per-tile sementara training tidak
 pernah begitu, dan `delta` FGA ikut ter-blend di sambungan tile — sebutkan itu
 bila melaporkan angka pada RealSet80.
+
+---
+
+## 10b. Menghindari hasil yang tertimpa
+
+Tidak ada satu pun skrip di repo ini yang memperingatkan saat menimpa:
+`inference_invsr.py` memakai `mkdir(delete=False)` lalu menulis PNG dengan nama
+berkas input yang sama, dan `save_fga` menimpa `.pth` apa adanya. Dua kali jalan
+dengan nama sama = hasil lama hilang tanpa jejak.
+
+Tiga lapis perlindungan:
+
+**1. Nama otomatis menyertakan rezim sampling.** `infer` menulis ke
+`out/baseline_s5`, `out/partial_v2_s5` — jadi hasil 1-step dan 5-step tidak
+pernah bertabrakan.
+
+**2. `--tag` memisahkan varian training.** Satu tag = satu direktori
+`experiments/fga_<mode>_<tag>/`. Ganti tag setiap kali komposisi loss berubah;
+itu juga yang membuat tabel ablasimu bisa dilacak.
+
+**3. Penjaga eksplisit.** `train`, `infer`, dan `metrics` menolak berjalan bila
+targetnya sudah berisi hasil:
+
+```
+RuntimeError: /vol/out/partial_v2_s5 sudah berisi 32 berkas *.png (mis. 0801_d0.png).
+Menjalankan ini akan menimpanya. Pilih salah satu:
+  - pakai --out-name <nama lain>, atau --tag yang berbeda
+  - tambahkan --overwrite bila memang ingin menimpa
+```
+
+Lewati dengan `--overwrite` hanya saat kamu memang ingin mengganti hasil itu —
+misalnya mengulang run yang gagal di tengah.
+
+`infer` juga punya `--out-name` untuk menamai direktori keluaran secara bebas,
+mis. `--out-name partial_v2_s5_wavelet` saat membandingkan efek `--color-fix`
+pada checkpoint yang sama.
 
 ---
 

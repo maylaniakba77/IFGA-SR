@@ -129,6 +129,27 @@ def _sh(*cmd: str) -> None:
     subprocess.run(list(cmd), cwd=REPO, check=True)
 
 
+def _guard_empty(path: str, pattern: str, overwrite: bool, hint: str) -> None:
+    """Tolak menulis ke direktori yang sudah berisi hasil.
+
+    Perlu karena tidak ada satu pun skrip di repo ini yang memperingatkan:
+    `inference_invsr.py` memakai mkdir(delete=False) lalu menulis PNG dengan
+    nama berkas input yang sama, dan `save_fga` menimpa .pth apa adanya. Dua
+    kali jalan dengan nama sama = hasil lama hilang tanpa jejak.
+    """
+    from pathlib import Path as _P
+    d = _P(path)
+    ada = sorted(d.glob(pattern)) if d.exists() else []
+    if ada and not overwrite:
+        raise RuntimeError(
+            f"{path} sudah berisi {len(ada)} berkas {pattern} "
+            f"(mis. {ada[0].name}).\n"
+            f"Menjalankan ini akan menimpanya. Pilih salah satu:\n"
+            f"  - {hint}\n"
+            f"  - tambahkan --overwrite bila memang ingin menimpa"
+        )
+
+
 def _write_config(num_steps: int) -> str:
     """Setara Phase 3 pada notebook Colab.
 
@@ -313,13 +334,22 @@ def train(
     crop: int = 256,
     num_steps: int = 1,
     freq_mode: str = "magnitude",
+    freq_cutoff: float = 0.25,
+    pixel_type: str = "l1",
+    w_pixel: float = 1.0,
     w_freq: float = 1.0,
     w_lpips: float = 0.5,
+    lpips_net: str = "alex",
     select_by: str = "lpips",
     inner_dim: int = 64,
+    lr: float = 1e-4,
+    amp: str = "bf16",
+    val_size: int = 32,
+    seed: int = 123456,
     log_every: int = 50,
     val_every: int = 500,
     tag: str = "mag",
+    overwrite: bool = False,
 ):
     """Latih modul FGA. Default di sini adalah konfigurasi yang MENDORONG ketajaman.
 
@@ -331,14 +361,21 @@ def train(
     freq_mode='full' w_freq=0.1 w_lpips=0.0 select_by='psnr' tag='base'.
     """
     vol.reload()
+    _guard_empty(f"{VOL}/experiments/fga_{mode}_{tag}", "*.pth", overwrite,
+                 "pakai --tag <nama lain>")
+
     _sh("python", "fga_integration/train_fga.py",
         "--data_dir", f"{VOL}/cache/steps{num_steps}",
         "--mode", mode,
         "--iters", str(iters), "--batch", str(batch), "--accum", str(accum),
         "--crop", str(crop), "--inner_dim", str(inner_dim),
-        "--lr", "1e-4", "--amp", "bf16", "--seed", "123456",
-        "--w_pixel", "1.0", "--w_freq", str(w_freq), "--freq_mode", freq_mode,
-        "--w_lpips", str(w_lpips), "--select_by", select_by,
+        "--lr", str(lr), "--amp", amp, "--seed", str(seed),
+        "--val_size", str(val_size),
+        "--pixel_type", pixel_type,
+        "--w_pixel", str(w_pixel), "--w_freq", str(w_freq),
+        "--freq_mode", freq_mode, "--freq_cutoff", str(freq_cutoff),
+        "--w_lpips", str(w_lpips), "--lpips_net", lpips_net,
+        "--select_by", select_by,
         "--val_every", str(val_every), "--save_every", str(val_every),
         "--log_every", str(log_every),
         "--out_dir", f"{VOL}/experiments/fga_{mode}_{tag}")
@@ -463,8 +500,30 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
 # --------------------------------------------------------------------------- #
 @app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=6 * 3600)
 def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
-          color_fix: str = ""):
-    """Jalankan inferensi pada split validasi (yang tidak pernah dilihat FGA)."""
+          color_fix: str = "", split_from: int = 1, out_name: str = "",
+          overwrite: bool = False):
+    """Jalankan inferensi pada split validasi (yang tidak pernah dilihat FGA).
+
+    `num_steps`  jadwal sampling yang DIPAKAI saat inferensi.
+    `split_from` cache yang MENDEFINISIKAN daftar gambar validasi.
+
+    Keduanya dipisah karena split val ditentukan oleh cache tempat model
+    dilatih (biasanya steps1). Kalau `num_steps` juga dipakai untuk mencari
+    daftar gambar, mengevaluasi di 5 step akan mencari `cache/steps5` yang
+    mungkin tidak pernah dibuat — dan lebih buruk lagi, mengevaluasi rezim
+    berbeda pada daftar gambar berbeda sehingga angkanya tidak sebanding.
+
+    Nama direktori keluaran menyertakan jumlah step (`baseline_s5`), supaya
+    hasil rezim berbeda tidak saling menimpa.
+
+    PERINGATAN TRAIN/TEST MISMATCH
+        Checkpoint FGA dilatih pada latent dari SATU jadwal sampling. Menjalankan
+        `--num-steps 5` pada checkpoint yang dilatih di steps1 berarti modul itu
+        melihat distribusi latent yang belum pernah dilatihkan. Itu eksperimen
+        yang sah (menguji ketahanan lintas rezim, H2), tetapi HARUS dilaporkan
+        sebagai itu — bukan sebagai "FGA di 5 step". Untuk yang terakhir, cache
+        dan latih ulang di --num-steps 5.
+    """
     import shutil
     from pathlib import Path
 
@@ -472,19 +531,32 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     cfg = _write_config(num_steps)
 
     # Rekonstruksi split val LatentHRDataset: val_size nama pertama (tersortir)
-    names = sorted(p.stem for p in Path(f"{VOL}/cache/steps{num_steps}/latent").glob("*.npy"))
-    assert names, "cache kosong"
+    split_dir = Path(f"{VOL}/cache/steps{split_from}/latent")
+    names = sorted(p.stem for p in split_dir.glob("*.npy"))
+    assert names, (f"tidak ada cache di {split_dir} — pakai --split-from N yang "
+                   f"menunjuk cache tempat model dilatih")
+    if num_steps != split_from:
+        print(f"[infer] PERINGATAN: sampling {num_steps} step, tetapi split val "
+              f"berasal dari cache steps{split_from}. Checkpoint FGA dilatih di "
+              f"steps{split_from} — laporkan ini sebagai uji lintas rezim.", flush=True)
     val_names = names[:min(32, max(1, len(names) // 10))]
     eval_lr = Path("/tmp/eval/lr")
     eval_lr.mkdir(parents=True, exist_ok=True)
     for n in val_names:
         shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
 
-    name = "baseline" if fga_mode == "none" else f"{fga_mode}_{tag}"
+    # color_fix masuk ke nama: tanpa ini, run polos dan run wavelet pada mode dan
+    # rezim step yang sama akan bertabrakan di direktori yang sama.
+    suffix = f"_s{num_steps}" + (f"_{color_fix}" if color_fix else "")
+    name = out_name or (f"baseline{suffix}" if fga_mode == "none"
+                        else f"{fga_mode}_{tag}{suffix}")
     # --sd_path dan --started_ckpt_path WAJIB. inference_invsr.py MENIMPA
     # cache_dir dan ckpt_path dari YAML dengan default './weights' (relatif ke
     # /repo, yang read-only di container), sehingga tanpa keduanya ia mencoba
     # mengunduh ulang sd-turbo ~2,5 GB setiap run -- atau langsung gagal menulis.
+    _guard_empty(f"{VOL}/out/{name}", "*.png", overwrite,
+                 "pakai --out-name <nama lain>, atau --tag yang berbeda")
+
     cmd = ["python", "inference_invsr.py",
            "-i", str(eval_lr), "-o", f"{VOL}/out/{name}",
            "--cfg_path", cfg, "-n", str(num_steps),
@@ -507,9 +579,11 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
 
 
 @app.function(image=metrics_image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=3600)
-def metrics(name: str = "baseline"):
+def metrics(name: str = "baseline", overwrite: bool = False):
     """PSNR/SSIM/LPIPS terhadap GT yang ditahan."""
     vol.reload()
+    _guard_empty(f"{VOL}/out", f"metrics_{name}.log", overwrite,
+                 "pakai --name yang berbeda")
     _sh("python", "scripts/cal_metrics_ref.py",
         "--gt_dir", f"{VOL}/eval/gt",
         "--sr_dir", f"{VOL}/out/{name}",

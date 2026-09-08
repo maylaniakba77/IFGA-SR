@@ -11,6 +11,8 @@ from pathlib import Path
 
 import os
 import math
+sys.path.append(str(Path(__file__).resolve().parent))
+import _numpy2_compat  # noqa: F401  -- harus sebelum `import pyiqa`
 import pyiqa
 import torch
 import argparse
