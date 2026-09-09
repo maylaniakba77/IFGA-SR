@@ -43,7 +43,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from diffusers import AutoencoderKL
 
-from fga_integration.losses import FGALoss, psnr, spectral_consistency
+from fga_integration.discriminator import (
+    PatchDiscriminator, d_hinge_loss, g_hinge_loss,
+)
+from fga_integration.losses import (
+    FGALoss, laplacian_var, psnr, spectral_consistency,
+)
 from fga_integration.patch_decoder import inject_fga
 
 
@@ -167,7 +172,8 @@ def infinite(loader):
 @torch.no_grad()
 def evaluate(vae, loader, criterion, scaling_factor, device, amp_dtype, lpips_model=None):
     vae.eval()
-    tot = {"loss_total": 0.0, "psnr": 0.0, "spec": 0.0}
+    tot = {"loss_total": 0.0, "psnr": 0.0, "spec": 0.0,
+           "lap": 0.0, "lap_gt": 0.0}
     if lpips_model is not None:
         tot["lpips"] = 0.0
     n = 0
@@ -180,12 +186,18 @@ def evaluate(vae, loader, criterion, scaling_factor, device, amp_dtype, lpips_mo
         tot["loss_total"] += parts["loss_total"]
         tot["psnr"] += psnr(rec, gt)
         tot["spec"] += spectral_consistency(rec, gt)
+        tot["lap"] += laplacian_var(rec)
+        tot["lap_gt"] += laplacian_var(gt)
         if lpips_model is not None:
             # LPIPS mengharapkan [-1, 1], sama dengan keluaran decode
             tot["lpips"] += float(lpips_model(rec, gt).mean())
         n += 1
     vae.train()
-    return {k: v / max(n, 1) for k, v in tot.items()}
+    out = {k: v / max(n, 1) for k, v in tot.items()}
+    # lap_ratio 1.0 = ketajaman setara GT. Inilah target yang benar; "lebih
+    # tajam dari baseline" bukan, karena baseline sendiri bisa melampaui GT.
+    out["lap_ratio"] = out["lap"] / max(out["lap_gt"], 1e-12)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +235,26 @@ def main():
     ap.add_argument("--w_pixel", type=float, default=1.0)
     ap.add_argument("--w_freq", type=float, default=0.1)
     ap.add_argument("--w_lpips", type=float, default=0.0)
+    # --- KHUSUS MEMPERTAJAM ---
+    ap.add_argument("--w_sharp", type=float, default=0.0,
+                    help="bobot loss ketajaman satu arah. Ini SATU-SATUNYA term "
+                         "yang dapat meminta keluaran lebih tajam dari baseline")
+    ap.add_argument("--sharp_ratio", type=float, default=1.0,
+                    help="target ketajaman sebagai kelipatan GT. 1.0 = setara "
+                         "foto asli; 1.6 = setara baseline InvSR; 2.0 = di atas "
+                         "baseline. Ini pilihan penelitianmu, bukan properti data")
+    # --- adversarial ---
+    ap.add_argument("--w_gan", type=float, default=0.0,
+                    help="bobot loss adversarial. 0 = nonaktif (discriminator "
+                         "tidak dibuat). Nilai wajar untuk SR: 0.02-0.1")
+    ap.add_argument("--d_lr", type=float, default=1e-4,
+                    help="learning rate discriminator")
+    ap.add_argument("--d_base", type=int, default=64, help="lebar dasar PatchGAN")
+    ap.add_argument("--gan_start", type=int, default=1000,
+                    help="step sebelum GAN diaktifkan. FGA di-zero-init, jadi "
+                         "memberi sinyal adversarial sejak step 0 membuatnya "
+                         "mengejar target yang bergerak sebelum punya apa pun "
+                         "untuk dinilai")
     ap.add_argument("--freq_mode", type=str, default="full",
                     choices=["full", "highpass", "magnitude"],
                     help="'full'/'highpass' sensitif fase sehingga mendorong penghalusan; "
@@ -231,10 +263,11 @@ def main():
                     help="batas band untuk freq_mode 'highpass' / 'magnitude'")
     ap.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg"])
     ap.add_argument("--select_by", type=str, default="psnr",
-                    choices=["psnr", "lpips", "loss"],
-                    help="metrik validasi pemilih checkpoint terbaik. 'psnr' memilih model "
-                         "TERBLUR (estimator MMSE); pakai 'lpips' bila target akhirnya "
-                         "ketajaman perseptual")
+                    choices=["psnr", "lpips", "loss", "sharp"],
+                    help="metrik validasi pemilih checkpoint terbaik. 'psnr' memilih "
+                         "model TERBLUR (estimator MMSE). 'sharp' memilih yang "
+                         "varians Laplacian-nya PALING DEKAT ke GT (lap_ratio -> 1) "
+                         "dan merupakan pilihan tepat bila targetnya ketajaman")
     # logging & checkpoint
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--log_every", type=int, default=50)
@@ -305,6 +338,8 @@ def main():
         w_pixel=args.w_pixel,
         w_freq=args.w_freq,
         w_lpips=args.w_lpips,
+        w_sharp=args.w_sharp,
+        sharp_ratio=args.sharp_ratio,
         freq_mode=args.freq_mode,
         freq_cutoff=args.freq_cutoff,
         lpips_net=args.lpips_net,
@@ -332,6 +367,9 @@ def main():
               "membuatnya ekuivalen dengan loss piksel (Parseval) dan sensitif fase, "
               "jadi ia MENDORONG PENGHALUSAN, bukan ketajaman. Pakai "
               "--freq_mode magnitude bila targetnya menambah detail.")
+    if args.w_sharp > 0:
+        print(f"[loss] loss ketajaman AKTIF: target {args.sharp_ratio}x ketajaman GT "
+              f"(bobot {args.w_sharp}). Satu arah — terlalu tajam tidak dihukum.")
     if args.select_by == "psnr":
         print("[ckpt] PERINGATAN: --select_by psnr memilih checkpoint dengan error "
               "kuadrat terkecil, yaitu varian paling halus. Pakai --select_by lpips "
@@ -345,6 +383,18 @@ def main():
                             betas=(0.9, 0.999))
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp == "fp16"))
 
+    # --- discriminator (hanya bila w_gan > 0) ---
+    # betas=(0.5, 0.9): konvensi GAN. Momentum tinggi membuat discriminator
+    # berosilasi karena targetnya bergerak setiap kali generator diperbarui.
+    d_net = opt_d = scaler_d = None
+    if args.w_gan > 0:
+        d_net = PatchDiscriminator(base=args.d_base).to(device)
+        opt_d = torch.optim.Adam(d_net.parameters(), lr=args.d_lr, betas=(0.5, 0.9))
+        scaler_d = torch.cuda.amp.GradScaler(enabled=(args.amp == "fp16"))
+        n_d = sum(p.numel() for p in d_net.parameters())
+        print(f"[gan] PatchDiscriminator: {n_d:,} parameter | w_gan={args.w_gan} "
+              f"| d_lr={args.d_lr} | aktif mulai step {args.gan_start}")
+
     def lr_at(step: int) -> float:
         if step < args.warmup:
             return args.lr * (step + 1) / args.warmup
@@ -354,7 +404,8 @@ def main():
     # --------------------------------------------------------------- training
     # Arah optimalitas tiap metrik pemilih: PSNR makin besar makin baik,
     # LPIPS dan loss makin kecil makin baik.
-    SELECT = {"psnr": ("psnr", 1.0), "lpips": ("lpips", -1.0), "loss": ("loss_total", -1.0)}
+    SELECT = {"psnr": ("psnr", 1.0), "lpips": ("lpips", -1.0),
+              "loss": ("loss_total", -1.0), "sharp": ("lap_dev", -1.0)}
     sel_key, sel_sign = SELECT[args.select_by]
 
     history, best_score, t0 = [], -1e9, time.time()
@@ -363,7 +414,11 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
 
+        gan_on = d_net is not None and step >= args.gan_start
+
         opt.zero_grad(set_to_none=True)
+        if gan_on:
+            opt_d.zero_grad(set_to_none=True)
         acc = {}
 
         for _ in range(args.accum):
@@ -375,8 +430,27 @@ def main():
                 rec = vae.decode(latent / scaling_factor).sample
 
             # Loss dihitung di float32 (FFT tidak stabil di half precision)
-            loss, parts = criterion(rec.float(), gt)
+            rec_f = rec.float()
+            loss, parts = criterion(rec_f, gt)
+
+            if gan_on:
+                # Bekukan D selama langkah generator. Tanpa ini, backward dari
+                # g_adv akan menumpuk gradien pada parameter D dan mencemari
+                # langkah D di bawah.
+                d_net.requires_grad_(False)
+                g_adv = g_hinge_loss(d_net(rec_f))
+                loss = loss + args.w_gan * g_adv
+                parts["loss_gan_g"] = float(g_adv.detach())
+
             scaler.scale(loss / args.accum).backward()
+
+            if gan_on:
+                # Langkah discriminator: memakai rec yang sudah di-detach, jadi
+                # tidak ada gradien yang mengalir kembali ke FGA dari sini.
+                d_net.requires_grad_(True)
+                d_loss = d_hinge_loss(d_net(gt), d_net(rec_f.detach()))
+                scaler_d.scale(d_loss / args.accum).backward()
+                parts["loss_gan_d"] = float(d_loss.detach())
 
             for k, v in parts.items():
                 acc[k] = acc.get(k, 0.0) + v / args.accum
@@ -386,6 +460,13 @@ def main():
             torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
         scaler.step(opt)
         scaler.update()
+
+        if gan_on:
+            if args.grad_clip > 0:
+                scaler_d.unscale_(opt_d)
+                torch.nn.utils.clip_grad_norm_(d_net.parameters(), args.grad_clip)
+            scaler_d.step(opt_d)
+            scaler_d.update()
 
         if (step + 1) % args.log_every == 0:
             el = time.time() - t0
@@ -399,7 +480,15 @@ def main():
                    f"psnr={m['psnr']:.3f} dB spec={m['spec']:.4f}")
             if "lpips" in m:
                 msg += f" lpips={m['lpips']:.4f}"
+            msg += f" lap_ratio={m['lap_ratio']:.3f}"
             print(msg)
+            # Deviasi dari TARGET ketajaman, bukan dari GT. Bila --w_sharp aktif,
+            # targetnya adalah --sharp_ratio; kalau tidak, GT (1.0). Tanpa ini,
+            # --select_by sharp akan memilih checkpoint yang menyamai GT padahal
+            # loss-nya sedang diminta melampaui GT — dua kriteria yang berlawanan.
+            sharp_target = args.sharp_ratio if args.w_sharp > 0 else 1.0
+            m["lap_target"] = sharp_target
+            m["lap_dev"] = abs(m["lap_ratio"] - sharp_target)
             history.append({"step": step + 1, "val": m})
             score = sel_sign * m[sel_key]
             if score > best_score:

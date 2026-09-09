@@ -178,7 +178,7 @@ def _gtag(gain: float) -> str:
     return "g" + str(gain).replace("-", "m").replace(".", "p")
 
 
-def _lap_var(d) -> float:
+def _lap_var(d, names=None) -> float:
     """Varians Laplacian rata-rata: ukuran ketajaman (kontras lokal absolut).
 
     Dipakai sebagai metrik pembanding utama karena FRAKSI energi HF ternyata
@@ -186,12 +186,17 @@ def _lap_var(d) -> float:
     kontras tepi 29% lebih rendah, karena HF-nya berupa noise difus.
     """
     import glob
+    import os
     import numpy as np
     from PIL import Image
 
     k = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], float)
+    files = (sorted(f"{d}/{n}.png" for n in names) if names
+             else sorted(glob.glob(f"{d}/*.png")))
     out = []
-    for q in sorted(glob.glob(f"{d}/*.png")):
+    for q in files:
+        if not os.path.exists(q):
+            continue
         a = np.asarray(Image.open(q).convert("L")).astype(np.float64) / 255
         c = sum(k[i + 1, j + 1] * np.roll(np.roll(a, i, 0), j, 1)
                 for i in (-1, 0, 1) for j in (-1, 0, 1))
@@ -410,9 +415,18 @@ def train(
     w_freq: float = 1.0,
     w_lpips: float = 0.5,
     lpips_net: str = "alex",
+    w_sharp: float = 0.0,
+    sharp_ratio: float = 1.0,
+    w_gan: float = 0.0,
+    d_lr: float = 1e-4,
+    d_base: int = 64,
+    gan_start: int = 1000,
     select_by: str = "lpips",
     inner_dim: int = 64,
     lr: float = 1e-4,
+    warmup: int = 500,
+    weight_decay: float = 1e-2,
+    grad_clip: float = 1.0,
     amp: str = "bf16",
     val_size: int = 32,
     split_by: str = "scene",
@@ -441,13 +455,18 @@ def train(
         "--mode", mode,
         "--iters", str(iters), "--batch", str(batch), "--accum", str(accum),
         "--crop", str(crop), "--inner_dim", str(inner_dim),
-        "--lr", str(lr), "--amp", amp, "--seed", str(seed),
+        "--lr", str(lr), "--warmup", str(warmup),
+        "--weight_decay", str(weight_decay), "--grad_clip", str(grad_clip),
+        "--amp", amp, "--seed", str(seed),
         "--val_size", str(val_size),
         "--split_by", split_by, "--val_scenes", str(val_scenes),
         "--pixel_type", pixel_type,
         "--w_pixel", str(w_pixel), "--w_freq", str(w_freq),
         "--freq_mode", freq_mode, "--freq_cutoff", str(freq_cutoff),
         "--w_lpips", str(w_lpips), "--lpips_net", lpips_net,
+        "--w_sharp", str(w_sharp), "--sharp_ratio", str(sharp_ratio),
+        "--w_gan", str(w_gan), "--d_lr", str(d_lr),
+        "--d_base", str(d_base), "--gan_start", str(gan_start),
         "--select_by", select_by,
         "--val_every", str(val_every), "--save_every", str(val_every),
         "--log_every", str(log_every),
@@ -739,7 +758,10 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
             print(f"[sweep] {name} sudah ada, dilewati", flush=True)
         hasil.append((g, name, _lap_var(out)))
 
-    gt = _lap_var(str(gt_dir))
+    # WAJIB memfilter dengan val_names: /vol/eval/gt MENUMPUK dari setiap
+    # pemanggilan infer sebelumnya, jadi mengukur seluruh direktori mencampur
+    # split yang berbeda dan membuat kolom "vs GT" salah.
+    gt = _lap_var(str(gt_dir), val_names)
     base = next((v for g, _, v in hasil if g == 0.0), None)
     vol.commit()
 

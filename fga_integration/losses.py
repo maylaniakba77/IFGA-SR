@@ -144,6 +144,55 @@ def spectral_magnitude_loss(
 
 
 # --------------------------------------------------------------------------- #
+# Sharpness loss — satu arah, target dapat melampaui GT
+# --------------------------------------------------------------------------- #
+_LAP_TRAIN = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).view(1, 1, 3, 3)
+
+
+def _lap_energy(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Energi Laplacian per citra (bisa dibackprop). x: (B,3,H,W) di [-1,1]."""
+    lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    lap = F.conv2d(lum, _LAP_TRAIN.to(lum.device, lum.dtype))
+    return lap[..., 2:-2, 2:-2].flatten(1).pow(2).mean(dim=1) + eps
+
+
+def sharpness_deficit_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ratio: float = 1.0,
+) -> torch.Tensor:
+    """Hukum HANYA bila `pred` KURANG tajam dari `ratio` x ketajaman GT.
+
+    L = relu(ratio - energi_laplacian(pred) / energi_laplacian(gt))
+
+    Tiga sifat yang membuatnya berbeda dari setiap loss lain di berkas ini:
+
+    1. SATU ARAH. Terlalu tajam sama sekali tidak dihukum, jadi tidak ada
+       tekanan balik ke arah blur. Setiap loss sebelumnya simetris atau berupa
+       jarak, sehingga penghalusan selalu menjadi jalan keluar murah.
+
+    2. TIDAK BISA DIPUASKAN DENGAN MENGHALUSKAN. Menghaluskan menurunkan energi
+       Laplacian, yang MENAIKKAN loss. Arah gradiennya secara struktural adalah
+       "tambah kontras lokal".
+
+    3. TARGETNYA DAPAT MELAMPAUI GT. `ratio` adalah pilihanmu, bukan properti
+       data. ratio=1.0 menyamai foto asli; ratio=1.6 menyamai ketajaman baseline
+       InvSR pada set 4-scene; ratio=2.0 melampauinya. Inilah satu-satunya
+       parameter di repo ini yang dapat meminta keluaran LEBIH tajam dari
+       baseline.
+
+    Buta fase: yang dibandingkan statistik energi, bukan posisi piksel. Tekstur
+    yang bergeser tidak dihukum.
+
+    PERINGATAN: mengejar ratio tinggi akan menaikkan ketajaman terukur, tetapi
+    kontras lokal dapat dinaikkan dengan noise maupun dengan detail. Selalu
+    dampingi dengan `--w_gan` > 0, yang menuntut teksturnya terlihat nyata,
+    dan verifikasi dengan CLIPIQA/MUSIQ.
+    """
+    return F.relu(ratio - _lap_energy(pred) / _lap_energy(target)).mean()
+
+
+# --------------------------------------------------------------------------- #
 # Combined loss module
 # --------------------------------------------------------------------------- #
 class FGALoss(nn.Module):
@@ -165,6 +214,8 @@ class FGALoss(nn.Module):
         w_pixel: float = 1.0,
         w_freq: float = 0.1,
         w_lpips: float = 0.0,
+        w_sharp: float = 0.0,
+        sharp_ratio: float = 1.0,
         freq_mode: str = "full",
         freq_cutoff: float = 0.25,
         lpips_net: str = "alex",
@@ -178,6 +229,8 @@ class FGALoss(nn.Module):
         self.w_pixel = w_pixel
         self.w_freq = w_freq
         self.w_lpips = w_lpips
+        self.w_sharp = w_sharp
+        self.sharp_ratio = sharp_ratio
         self.freq_mode = freq_mode
         self.freq_cutoff = freq_cutoff
 
@@ -225,6 +278,11 @@ class FGALoss(nn.Module):
             "loss_freq": float(l_freq.detach()),
         }
 
+        if self.w_sharp > 0:
+            l_sharp = sharpness_deficit_loss(pred, target, self.sharp_ratio)
+            total = total + self.w_sharp * l_sharp
+            parts["loss_sharp"] = float(l_sharp.detach())
+
         if self.lpips is not None:
             l_lpips = self.lpips(pred, target).mean()
             total = total + self.w_lpips * l_lpips
@@ -249,6 +307,32 @@ def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 2.0) -> f
     if mse.item() == 0:
         return float("inf")
     return float(10.0 * torch.log10(data_range**2 / mse))
+
+
+_LAP_K = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).view(1, 1, 3, 3)
+
+
+@torch.no_grad()
+def laplacian_var(x: torch.Tensor) -> float:
+    """Varians Laplacian pada kanal luminansi: ukuran KONTRAS LOKAL absolut.
+
+    Inilah metrik ketajaman yang dipakai untuk mengevaluasi pekerjaan ini, dan
+    ia dipantau di sini supaya kemajuannya terlihat SELAMA training.
+
+    Kenapa bukan fraksi energi frekuensi tinggi: fraksi HF ternyata menyesatkan.
+    Baseline InvSR punya fraksi HF LEBIH TINGGI dari GT (0.5755 vs 0.5488) tetapi
+    kontras tepi 29% LEBIH RENDAH — karena energi HF-nya berupa noise difus
+    beramplitudo kecil, bukan tepi yang terstruktur. Varians Laplacian tidak
+    tertipu oleh itu.
+
+    Args:
+        x: (B, 3, H, W) pada rentang [-1, 1].
+    """
+    lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    lap = F.conv2d(lum.float(), _LAP_K.to(lum.device, torch.float32))
+    # buang 2 piksel tepi: kernel di batas tidak mencerminkan konten
+    lap = lap[..., 2:-2, 2:-2]
+    return float(lap.flatten(1).var(dim=1).mean())
 
 
 @torch.no_grad()
