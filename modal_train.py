@@ -102,10 +102,23 @@ def _with_repo(img: modal.Image) -> modal.Image:
     copy=False: berkas dimount saat container start, bukan dibakar ke image,
     sehingga mengedit losses.py tidak memicu rebuild.
     """
+    # Abaikan setiap artefak data. Dua alasan, keduanya pernah menggagalkan run:
+    #
+    # 1. Mengunduh hasil ke direktori kerja SAAT run berjalan membuat Modal
+    #    membatalkan dengan "was modified during build process", karena berkas
+    #    berubah di tengah upload.
+    # 2. Tanpa ini setiap run mengunggah ratusan MB PNG/checkpoint yang tidak
+    #    pernah dibaca container — kode saja yang dibutuhkan.
+    #
+    # Tidak ada citra di repo yang diperlukan saat runtime: aset demo ada di
+    # assets/ dan testdata/, keduanya sudah diabaikan.
     return img.add_local_dir(
         ".", REPO,
-        ignore=["**/.git", "**/__pycache__", "**/*.pyc", "assets/**",
-                "testdata/**", "notebooks/**", "data/**", "experiments/**"],
+        ignore=["**/.git", "**/__pycache__", "**/*.pyc",
+                "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp", "**/*.bmp",
+                "**/*.npy", "**/*.pth", "**/*.log", "**/*.zip",
+                "assets/**", "testdata/**", "notebooks/**",
+                "data/**", "experiments/**", "out/**", "gt/**"],
     )
 
 
@@ -417,6 +430,7 @@ def train(
     lpips_net: str = "alex",
     w_sharp: float = 0.0,
     sharp_ratio: float = 1.0,
+    w_range: float = 1.0,
     w_gan: float = 0.0,
     d_lr: float = 1e-4,
     d_base: int = 64,
@@ -465,6 +479,7 @@ def train(
         "--freq_mode", freq_mode, "--freq_cutoff", str(freq_cutoff),
         "--w_lpips", str(w_lpips), "--lpips_net", lpips_net,
         "--w_sharp", str(w_sharp), "--sharp_ratio", str(sharp_ratio),
+        "--w_range", str(w_range),
         "--w_gan", str(w_gan), "--d_lr", str(d_lr),
         "--d_base", str(d_base), "--gan_start", str(gan_start),
         "--select_by", select_by,
@@ -472,6 +487,54 @@ def train(
         "--log_every", str(log_every),
         "--out_dir", f"{VOL}/experiments/fga_{mode}_{tag}")
     vol.commit()
+
+
+@app.function(image=image, volumes={VOL: vol}, timeout=1800)
+def sharpness(names: str, scenes: str = "", split_from: int = 1,
+              split_by: str = "scene", val_scenes: int = 8, per_scene: int = 0):
+    """Bandingkan ketajaman beberapa direktori keluaran terhadap GT.
+
+    Metriknya varians Laplacian: kontras lokal absolut. Ini yang dipakai sebagai
+    ukuran ketajaman di seluruh pekerjaan ini, BUKAN fraksi energi frekuensi
+    tinggi — fraksi HF menyesatkan karena baseline InvSR punya fraksi HF lebih
+    tinggi dari GT (0.5755 vs 0.5488) sementara kontras tepinya 29% lebih rendah;
+    energi HF-nya berupa noise difus, bukan tepi terstruktur.
+
+    Semua direktori diukur pada DAFTAR NAMA YANG SAMA, jadi angkanya sebanding.
+    Tanpa itu perbandingan tidak sah: varians Laplacian GT berbeda 2,8x antar
+    subset scene, sehingga konten scene mendominasi metrik.
+
+    Contoh:
+        modal run modal_train.py::sharpness \
+          --names baseline_e8,partial_sharp2x_s1,full_sharp2x_s1 \
+          --scenes 0801,0802,0803,0804,0805,0806,0807,0808
+    """
+    import os
+
+    vol.reload()
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    n_sc = len({_scene_of(n) for n in val_names})
+    print(f"[sharpness] {len(val_names)} gambar dari {n_sc} scene\n")
+
+    gt = _lap_var(f"{VOL}/eval/gt", val_names)
+    dirs = [d.strip() for d in names.split(",") if d.strip()]
+    base = None
+    rows = []
+    for d in dirs:
+        path = f"{VOL}/out/{d}"
+        if not os.path.isdir(path):
+            print(f"{d:32} TIDAK ADA")
+            continue
+        v = _lap_var(path, val_names)
+        if base is None:
+            base = v          # direktori PERTAMA jadi acuan; taruh baseline di depan
+        rows.append((d, v))
+
+    print(f"{'kondisi':32}{'ketajaman':>12}{'vs acuan':>10}{'vs GT':>8}")
+    print(f"{'GT (foto asli)':32}{gt:12.6f}{'':>10}{1.0:>7.2f}x")
+    for d, v in rows:
+        print(f"{d:32}{v:12.6f}{100 * (v / base - 1):>9.0f}%{v / gt:>7.2f}x")
+    print("\nvs acuan dihitung terhadap direktori PERTAMA pada --names.")
 
 
 @app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=1800)
@@ -780,7 +843,7 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
 
 
 @app.function(image=image, volumes={VOL: vol}, timeout=600)
-def gate_diff(tags: str = "partial_mag,full_mag"):
+def gate_diff(tags: str = "partial_mag,full_mag", baseline: str = "baseline"):
     """GATE 3 — keluaran varian HARUS berbeda dari baseline.
 
     Nilai 0.0 berarti bobot FGA tidak sampai ke model, dan seluruh metrik
@@ -792,9 +855,9 @@ def gate_diff(tags: str = "partial_mag,full_mag"):
     from PIL import Image
 
     vol.reload()
-    base_dir = f"{VOL}/out/baseline"
+    base_dir = f"{VOL}/out/{baseline}"
     base = sorted(os.listdir(base_dir))
-    assert base, "baseline belum dijalankan"
+    assert base, f"baseline belum dijalankan di {base_dir}"
 
     def load(d, n):
         return np.asarray(Image.open(os.path.join(d, n))).astype(np.float64)

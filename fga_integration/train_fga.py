@@ -239,6 +239,10 @@ def main():
     ap.add_argument("--w_sharp", type=float, default=0.0,
                     help="bobot loss ketajaman satu arah. Ini SATU-SATUNYA term "
                          "yang dapat meminta keluaran lebih tajam dari baseline")
+    ap.add_argument("--w_range", type=float, default=1.0,
+                    help="hukuman untuk piksel di luar [-1,1]. Jaga > 0 bila "
+                         "--w_sharp > 0, kalau tidak akan muncul bintik warna "
+                         "jenuh pada keluaran")
     ap.add_argument("--sharp_ratio", type=float, default=1.0,
                     help="target ketajaman sebagai kelipatan GT. 1.0 = setara "
                          "foto asli; 1.6 = setara baseline InvSR; 2.0 = di atas "
@@ -340,6 +344,7 @@ def main():
         w_lpips=args.w_lpips,
         w_sharp=args.w_sharp,
         sharp_ratio=args.sharp_ratio,
+        w_range=args.w_range,
         freq_mode=args.freq_mode,
         freq_cutoff=args.freq_cutoff,
         lpips_net=args.lpips_net,

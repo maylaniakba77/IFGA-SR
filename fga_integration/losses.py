@@ -216,6 +216,7 @@ class FGALoss(nn.Module):
         w_lpips: float = 0.0,
         w_sharp: float = 0.0,
         sharp_ratio: float = 1.0,
+        w_range: float = 1.0,
         freq_mode: str = "full",
         freq_cutoff: float = 0.25,
         lpips_net: str = "alex",
@@ -231,6 +232,7 @@ class FGALoss(nn.Module):
         self.w_lpips = w_lpips
         self.w_sharp = w_sharp
         self.sharp_ratio = sharp_ratio
+        self.w_range = w_range
         self.freq_mode = freq_mode
         self.freq_cutoff = freq_cutoff
 
@@ -282,6 +284,22 @@ class FGALoss(nn.Module):
             l_sharp = sharpness_deficit_loss(pred, target, self.sharp_ratio)
             total = total + self.w_sharp * l_sharp
             parts["loss_sharp"] = float(l_sharp.detach())
+
+        if self.w_range > 0:
+            # Hukum nilai piksel di luar [-1, 1].
+            #
+            # WAJIB bila w_sharp > 0. `sharpness_deficit_loss` satu arah dan tak
+            # berbatas, dan dihitung pada keluaran yang BELUM di-clamp — sehingga
+            # optimizer bisa mendapat energi Laplacian secara gratis dengan
+            # mendorong piksel jauh ke luar rentang. Saat inferensi nilai itu
+            # terpotong per-kanal dan muncul sebagai bintik magenta terang
+            # (teramati: 273 piksel [231, 58, 137] pada 0801_d0.png).
+            #
+            # Meng-clamp pred sebagai gantinya TIDAK menyelesaikannya: gradien di
+            # luar rentang menjadi nol, jadi lonjakannya tidak pernah dihukum.
+            l_rng = F.relu(pred.abs() - 1.0).mean()
+            total = total + self.w_range * l_rng
+            parts["loss_range"] = float(l_rng.detach())
 
         if self.lpips is not None:
             l_lpips = self.lpips(pred, target).mean()

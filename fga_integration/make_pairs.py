@@ -34,6 +34,7 @@ CATATAN PENTING
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import random
 from pathlib import Path
@@ -180,6 +181,23 @@ def main() -> None:
             lr_out, gt_out = out_dir / "lr" / name, out_dir / "gt" / name
             if lr_out.exists() and gt_out.exists():
                 continue  # aman untuk dilanjutkan setelah interupsi
+
+            # Seed per (citra, undian) — BUKAN sekali di awal main().
+            #
+            # CACAT YANG DIPERBAIKI: loop ini melakukan `continue` untuk berkas
+            # yang sudah ada, sehingga `ds[i]` tidak dipanggil dan RNG tidak
+            # maju. Menjalankan ulang dengan --draws lebih besar karena itu
+            # MENGULANG kernel yang sama: dengan seed tetap, d4 mendapat undian
+            # yang dulu didapat d0. Terverifikasi — 0801_d0.png dan 0801_d4.png
+            # byte-identik (MD5 sama), begitu pula d1/d5.
+            #
+            # Seed diturunkan dari (stem, d, args.seed), jadi setiap undian
+            # deterministik, saling berbeda, dan TIDAK bergantung pada berkas
+            # mana yang dilewati.
+            sd = int(hashlib.md5(f"{stem}|{d}|{args.seed}".encode()).hexdigest()[:8], 16)
+            random.seed(sd)
+            np.random.seed(sd)
+            torch.manual_seed(sd)
 
             item = ds[i]  # crop + augmentasi + kernel acak baru setiap pemanggilan
             with torch.no_grad():
