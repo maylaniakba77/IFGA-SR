@@ -1,7 +1,11 @@
 from fga_integration.fga_upsampler import FGAUpsample2D
 
-def inject_fga(vae, mode="partial", inner_dim=64):
-    """mode: 'none' (baseline) | 'partial' | 'full'"""
+def inject_fga(vae, mode="partial", inner_dim=64, gain=1.0):
+    """mode: 'none' (baseline) | 'partial' | 'full'
+
+    gain: skala cabang residual saat inferensi. Selalu 1.0 saat training.
+          0.0 = baseline persis, <0 = unsharp mask (lihat FGAUpsample2D).
+    """
     if mode == "none":
         return []
     targets = [(bi, ui)
@@ -19,6 +23,7 @@ def inject_fga(vae, mode="partial", inner_dim=64):
                                                  orig.conv.weight.dtype)
         # FGA tetap float32 apa pun dtype backbone: itulah presisi pelatihannya.
         new.fga.float()
+        new.gain = float(gain)
         blk.upsamplers[ui] = new
         trainable += list(new.fga.parameters())
     return trainable

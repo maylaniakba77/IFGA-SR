@@ -48,6 +48,11 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--fga_ckpt", type=str, default="", help="Trained FGA checkpoint (.pth)",
     )
+    parser.add_argument(
+        "--fga_gain", type=float, default=None,
+        help="Scale of the FGA residual branch. 1.0 = as trained, 0.0 = exactly "
+             "baseline, negative = unsharp mask (the learned delta is high-pass).",
+    )
     args = parser.parse_args()
 
     return args
@@ -103,6 +108,8 @@ def get_configs(args):
         configs.fga_mode = args.fga_mode
     if args.fga_ckpt:
         configs.fga_ckpt = args.fga_ckpt
+    if args.fga_gain is not None:
+        configs.fga_gain = args.fga_gain
 
     configs.bs = args.bs
     configs.tiled_vae = args.tiled_vae

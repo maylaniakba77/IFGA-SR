@@ -59,18 +59,52 @@ class LatentHRDataset(Dataset):
         └── gt/      <nama>.npy   (3, H, W)  float16, rentang [0, 1]
     """
 
+    @staticmethod
+    def scene_of(name: str) -> str:
+        """Ambil identitas scene dari nama berkas.
+
+        make_pairs.py menamai berkas `<scene>_d<draw>` bila --draws > 1, dan
+        `<scene>` saja bila --draws 1. Jadi memotong pada '_d' memberi scene
+        pada kedua kasus.
+        """
+        return name.split("_d")[0]
+
     def __init__(self, data_dir: str, split: str = "train", val_size: int = 32,
-                 crop: int = 0):
+                 crop: int = 0, split_by: str = "scene", val_scenes: int = 8):
         root = Path(data_dir)
         names = sorted(p.stem for p in (root / "latent").glob("*.npy"))
         if len(names) == 0:
             raise FileNotFoundError(f"Tidak ada latent di {root / 'latent'}")
 
-        # Split deterministik agar train/val konsisten antar-run dan antar-varian
-        val_size = min(val_size, max(1, len(names) // 10))
-        self.names = names[val_size:] if split == "train" else names[:val_size]
+        if split_by == "scene":
+            # Split berbasis SCENE: tahan `val_scenes` scene pertama beserta
+            # SELURUH draw-nya. Independen dari --draws, jadi menambah undian
+            # degradasi tidak menggeser batas train/val.
+            scenes = sorted({self.scene_of(n) for n in names})
+            if len(scenes) <= val_scenes:
+                raise ValueError(
+                    f"hanya {len(scenes)} scene tersedia, --val_scenes={val_scenes} "
+                    "tidak menyisakan data training"
+                )
+            held = set(scenes[:val_scenes])
+            want_held = split == "val"
+            self.names = [n for n in names
+                          if (self.scene_of(n) in held) == want_held]
+        else:
+            # Perilaku lama: `val_size` NAMA pertama setelah disortir.
+            #
+            # CACAT YANG DIKETAHUI — dipertahankan hanya untuk mereproduksi run
+            # lama. Karena nama berformat <scene>_d<draw>, mengubah --draws
+            # menggeser batas split: pada draws=4 val berisi 8 scene x 4 draw,
+            # pada draws=8 ia menjadi 4 scene x 8 draw. Scene yang tadinya
+            # validasi bisa berpindah ke training, sehingga checkpoint sebelum
+            # dan sesudah perubahan --draws TIDAK dapat dibandingkan.
+            val_size = min(val_size, max(1, len(names) // 10))
+            self.names = names[val_size:] if split == "train" else names[:val_size]
+
         self.root = root
         self.split = split
+        self.split_by = split_by
         # crop dinyatakan dalam piksel HR; 0 = nonaktif (perilaku lama)
         if crop and crop % 8 != 0:
             raise ValueError(f"--crop {crop} harus habis dibagi 8 (rasio latent:HR)")
@@ -161,7 +195,13 @@ def main():
     ap = argparse.ArgumentParser()
     # data
     ap.add_argument("--data_dir", type=str, required=True, help="hasil cache_latents.py")
-    ap.add_argument("--val_size", type=int, default=32)
+    ap.add_argument("--val_size", type=int, default=32,
+                    help="hanya untuk --split_by name (perilaku lama)")
+    ap.add_argument("--split_by", type=str, default="scene", choices=["scene", "name"],
+                    help="'scene' menahan scene utuh dan STABIL terhadap --draws; "
+                         "'name' adalah perilaku lama yang bergeser bila --draws berubah")
+    ap.add_argument("--val_scenes", type=int, default=8,
+                    help="jumlah scene yang ditahan bila --split_by scene")
     ap.add_argument("--crop", type=int, default=0,
                     help="crop acak dalam piksel HR (harus kelipatan 8); 0 = citra penuh. "
                          "Dengan crop seragam, --batch > 1 menjadi legal")
@@ -238,10 +278,21 @@ def main():
     print(f"[model] vae.config.scaling_factor = {scaling_factor}")
 
     # ------------------------------------------------------------------ data
-    ds_tr = LatentHRDataset(args.data_dir, "train", args.val_size, crop=args.crop)
-    ds_va = LatentHRDataset(args.data_dir, "val", args.val_size, crop=args.crop)
-    print(f"[data] train={len(ds_tr)} | val={len(ds_va)} | "
+    mk = lambda sp: LatentHRDataset(args.data_dir, sp, args.val_size, crop=args.crop,
+                                    split_by=args.split_by, val_scenes=args.val_scenes)
+    ds_tr, ds_va = mk("train"), mk("val")
+    n_sc_tr = len({LatentHRDataset.scene_of(n) for n in ds_tr.names})
+    n_sc_va = len({LatentHRDataset.scene_of(n) for n in ds_va.names})
+    print(f"[data] train={len(ds_tr)} ({n_sc_tr} scene) | "
+          f"val={len(ds_va)} ({n_sc_va} scene) | split_by={args.split_by} | "
           f"crop={args.crop or 'nonaktif (citra penuh)'}")
+    if args.split_by == "name":
+        print("[data] PERINGATAN: --split_by name bergeser bila --draws berubah; "
+              "run sebelum dan sesudah perubahan draws tidak sebanding.")
+    if n_sc_va < 8:
+        print(f"[data] PERINGATAN: hanya {n_sc_va} scene di validasi. Metrik "
+              "ketajaman didominasi konten scene (varians GT bisa berbeda 2,8x "
+              "antar-subset), jadi kesimpulan dari set sekecil ini tidak andal.")
 
     dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True,
                        num_workers=2, pin_memory=True, drop_last=True)

@@ -124,8 +124,9 @@ class BaseSampler:
             )
             # inner_dim must come from the checkpoint: a mismatch would silently
             # produce shape errors, or worse, non-overlapping keys.
+            fga_gain = float(self.configs.get("fga_gain", 1.0))
             inject_fga(sd_pipe.vae, mode=fga_mode,
-                       inner_dim=ckpt.get("inner_dim", 64))
+                       inner_dim=ckpt.get("inner_dim", 64), gain=fga_gain)
             missing, unexpected = sd_pipe.vae.load_state_dict(
                 ckpt["state_dict"], strict=False
             )
@@ -136,7 +137,7 @@ class BaseSampler:
             )
             self.write_log(
                 f"Loaded FGA weights ({fga_mode}, inner_dim={ckpt.get('inner_dim', 64)}, "
-                f"step={ckpt.get('step')}) from {fga_ckpt}"
+                f"gain={fga_gain}, step={ckpt.get('step')}) from {fga_ckpt}"
             )
 
 class InvSamplerSR(BaseSampler):

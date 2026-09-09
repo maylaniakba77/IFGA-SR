@@ -624,6 +624,65 @@ bila melaporkan angka pada RealSet80.
 
 ---
 
+## 10a. Set evaluasi: cacat split dan cara menghindarinya
+
+**Cacat yang ditemukan pada 2026-09-09.** `LatentHRDataset` versi lama memilih
+validasi sebagai **32 nama pertama setelah disortir**. Karena `make_pairs.py`
+menamai berkas `<scene>_d<draw>`, batas itu bergeser setiap kali `--draws`
+berubah:
+
+| `--draws` | 32 nama pertama | scene unik |
+|---|---|---|
+| 4 | 0801–0808 x d0–d3 | 8 |
+| 8 | 0801–0804 x d0–d7 | **4** |
+
+Hanya 16 nama beririsan. Konsekuensinya berlapis:
+
+- Hasil sebelum dan sesudah perubahan `--draws` **dievaluasi pada gambar yang
+  berbeda**, jadi tidak sebanding.
+- Scene 0805–0808 berpindah dari validasi ke **training**, sehingga checkpoint
+  lama dan baru bahkan tidak berbagi definisi "data yang belum dilihat".
+- Keragaman scene turun dari 8 ke 4.
+
+**Mengapa ini fatal untuk metrik ketajaman.** Varians Laplacian GT terukur
+0.019818 pada subset 8-scene dan 0.007133 pada subset 4-scene — berbeda **2,8x**.
+Metrik ketajaman didominasi konten scene, bukan model. Pada subset lama baseline
+tampak 29% **di bawah** GT; pada subset baru ia 46% **di atas** GT. Kesimpulan
+yang berlawanan dari model yang sama.
+
+### Perbaikannya
+
+`--split-by scene` (sekarang default) menahan scene utuh beserta seluruh
+draw-nya, jadi menambah undian degradasi tidak lagi menggeser batas train/val:
+
+```bash
+modal run --detach modal_train.py::train --mode partial \
+  --split-by scene --val-scenes 8 --tag v3
+```
+
+`--split-by name` masih ada, khusus untuk mereproduksi run lama. Ia mencetak
+peringatan, dan nilainya terekam di `config.json`.
+
+### Set evaluasi eksplisit
+
+Untuk perbandingan yang harus tahan terhadap perubahan data apa pun, sebut
+scene-nya secara langsung — ini mengabaikan seluruh logika split:
+
+```bash
+modal run modal_train.py::infer --fga-mode partial --tag v2 \
+  --scenes 0801,0802,0803,0804 --out-name partial_v2_fixed
+```
+
+`--per-scene N` mengambil N draw pertama tiap scene. Untuk metrik ketajaman,
+**banyak scene x sedikit draw** jauh lebih informatif daripada sedikit scene x
+banyak draw pada jumlah gambar yang sama.
+
+> **Aturan.** Saat membandingkan checkpoint yang dilatih pada split berbeda, set
+> evaluasi harus berisi hanya scene yang ditahan dari **semua** checkpoint yang
+> dibandingkan. Untuk checkpoint di repo ini, irisan itu adalah 0801–0804.
+
+---
+
 ## 10b. Menghindari hasil yang tertimpa
 
 Tidak ada satu pun skrip di repo ini yang memperingatkan saat menimpa:

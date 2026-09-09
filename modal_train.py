@@ -129,6 +129,76 @@ def _sh(*cmd: str) -> None:
     subprocess.run(list(cmd), cwd=REPO, check=True)
 
 
+def _scene_of(name: str) -> str:
+    return name.split("_d")[0]
+
+
+def _eval_names(split_from: int, scenes: str = "", split_by: str = "scene",
+                val_scenes: int = 8, val_size: int = 32,
+                per_scene: int = 0) -> list:
+    """Tentukan daftar gambar evaluasi. SATU sumber kebenaran untuk semua fungsi.
+
+    `scenes`  daftar scene eksplisit dipisah koma, mis. "0801,0802,0803,0804".
+              Bila diisi, ia MENGABAIKAN opsi split lain — inilah cara paling
+              andal membuat set evaluasi tetap, karena hasilnya tidak bergantung
+              pada --draws maupun jumlah berkas di cache.
+    `per_scene` bila > 0, ambil hanya N draw pertama per scene. Untuk metrik
+              ketajaman, banyak scene x sedikit draw jauh lebih informatif
+              daripada sedikit scene x banyak draw pada jumlah gambar sama.
+    """
+    from pathlib import Path as _P
+    names = sorted(q.stem for q in
+                   _P(f"{VOL}/cache/steps{split_from}/latent").glob("*.npy"))
+    assert names, f"tidak ada cache di steps{split_from}"
+
+    if scenes:
+        want = {x.strip() for x in scenes.split(",")}
+        sel = [n for n in names if _scene_of(n) in want]
+        hilang = want - {_scene_of(n) for n in sel}
+        assert not hilang, f"scene tidak ada di cache: {sorted(hilang)}"
+    elif split_by == "scene":
+        uniq = sorted({_scene_of(n) for n in names})
+        sel = [n for n in names if _scene_of(n) in set(uniq[:val_scenes])]
+    else:
+        sel = names[:min(val_size, max(1, len(names) // 10))]
+
+    if per_scene:
+        per, out = {}, []
+        for n in sel:
+            sc = _scene_of(n)
+            if per.get(sc, 0) < per_scene:
+                per[sc] = per.get(sc, 0) + 1
+                out.append(n)
+        sel = out
+    return sel
+
+
+def _gtag(gain: float) -> str:
+    """Nama direktori yang aman untuk nilai gain: -0.5 -> gm0p5, 1.0 -> g1p0."""
+    return "g" + str(gain).replace("-", "m").replace(".", "p")
+
+
+def _lap_var(d) -> float:
+    """Varians Laplacian rata-rata: ukuran ketajaman (kontras lokal absolut).
+
+    Dipakai sebagai metrik pembanding utama karena FRAKSI energi HF ternyata
+    menyesatkan di sini — baseline punya fraksi HF lebih tinggi dari GT namun
+    kontras tepi 29% lebih rendah, karena HF-nya berupa noise difus.
+    """
+    import glob
+    import numpy as np
+    from PIL import Image
+
+    k = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], float)
+    out = []
+    for q in sorted(glob.glob(f"{d}/*.png")):
+        a = np.asarray(Image.open(q).convert("L")).astype(np.float64) / 255
+        c = sum(k[i + 1, j + 1] * np.roll(np.roll(a, i, 0), j, 1)
+                for i in (-1, 0, 1) for j in (-1, 0, 1))
+        out.append(c[2:-2, 2:-2].var())
+    return float(np.mean(out)) if out else float("nan")
+
+
 def _guard_empty(path: str, pattern: str, overwrite: bool, hint: str) -> None:
     """Tolak menulis ke direktori yang sudah berisi hasil.
 
@@ -345,6 +415,8 @@ def train(
     lr: float = 1e-4,
     amp: str = "bf16",
     val_size: int = 32,
+    split_by: str = "scene",
+    val_scenes: int = 8,
     seed: int = 123456,
     log_every: int = 50,
     val_every: int = 500,
@@ -371,6 +443,7 @@ def train(
         "--crop", str(crop), "--inner_dim", str(inner_dim),
         "--lr", str(lr), "--amp", amp, "--seed", str(seed),
         "--val_size", str(val_size),
+        "--split_by", split_by, "--val_scenes", str(val_scenes),
         "--pixel_type", pixel_type,
         "--w_pixel", str(w_pixel), "--w_freq", str(w_freq),
         "--freq_mode", freq_mode, "--freq_cutoff", str(freq_cutoff),
@@ -501,7 +574,8 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
 @app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=6 * 3600)
 def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
           color_fix: str = "", split_from: int = 1, out_name: str = "",
-          overwrite: bool = False):
+          gain: float = 1.0, scenes: str = "", split_by: str = "scene",
+          val_scenes: int = 8, per_scene: int = 0, overwrite: bool = False):
     """Jalankan inferensi pada split validasi (yang tidak pernah dilihat FGA).
 
     `num_steps`  jadwal sampling yang DIPAKAI saat inferensi.
@@ -531,15 +605,19 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     cfg = _write_config(num_steps)
 
     # Rekonstruksi split val LatentHRDataset: val_size nama pertama (tersortir)
-    split_dir = Path(f"{VOL}/cache/steps{split_from}/latent")
-    names = sorted(p.stem for p in split_dir.glob("*.npy"))
-    assert names, (f"tidak ada cache di {split_dir} — pakai --split-from N yang "
-                   f"menunjuk cache tempat model dilatih")
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    n_sc = len({_scene_of(n) for n in val_names})
+    print(f"[infer] set evaluasi: {len(val_names)} gambar dari {n_sc} scene"
+          + (f" (scene eksplisit: {scenes})" if scenes else f" (split_by={split_by})"),
+          flush=True)
+    if n_sc < 8:
+        print(f"[infer] PERINGATAN: hanya {n_sc} scene. Metrik ketajaman "
+              "didominasi konten scene — bandingkan HANYA terhadap kondisi lain "
+              "pada scene yang identik.", flush=True)
     if num_steps != split_from:
         print(f"[infer] PERINGATAN: sampling {num_steps} step, tetapi split val "
               f"berasal dari cache steps{split_from}. Checkpoint FGA dilatih di "
               f"steps{split_from} — laporkan ini sebagai uji lintas rezim.", flush=True)
-    val_names = names[:min(32, max(1, len(names) // 10))]
     eval_lr = Path("/tmp/eval/lr")
     eval_lr.mkdir(parents=True, exist_ok=True)
     for n in val_names:
@@ -547,7 +625,8 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
 
     # color_fix masuk ke nama: tanpa ini, run polos dan run wavelet pada mode dan
     # rezim step yang sama akan bertabrakan di direktori yang sama.
-    suffix = f"_s{num_steps}" + (f"_{color_fix}" if color_fix else "")
+    suffix = (f"_s{num_steps}" + (f"_{color_fix}" if color_fix else "")
+              + (f"_{_gtag(gain)}" if gain != 1.0 else ""))
     name = out_name or (f"baseline{suffix}" if fga_mode == "none"
                         else f"{fga_mode}_{tag}{suffix}")
     # --sd_path dan --started_ckpt_path WAJIB. inference_invsr.py MENIMPA
@@ -568,6 +647,8 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
                 f"{VOL}/experiments/fga_{fga_mode}_{tag}/fga_{fga_mode}_best.pth"]
     if color_fix:
         cmd += ["--color_fix", color_fix]
+    if fga_mode != "none":
+        cmd += ["--fga_gain", str(gain)]
     _sh(*cmd)
 
     # GATE 3 — GT juga disalin supaya `metrics` punya referensi
@@ -589,6 +670,91 @@ def metrics(name: str = "baseline", overwrite: bool = False):
         "--sr_dir", f"{VOL}/out/{name}",
         "--log_name", f"{VOL}/out/metrics_{name}.log")
     vol.commit()
+
+
+@app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=6 * 3600)
+def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
+               split_from: int = 1, color_fix: str = "",
+               gains: str = "-1,-0.5,0,0.5,1", scenes: str = "",
+               split_by: str = "scene", val_scenes: int = 8,
+               per_scene: int = 0, overwrite: bool = False):
+    """Sapu gain cabang residual FGA pada SATU checkpoint, tanpa training ulang.
+
+    Modul terlatih terbukti mempelajari operator high-pass yang mengurangkan
+    detail (korelasi -0.59 terhadap highpass(baseline)). Karena itu gain bekerja
+    sebagai kendali ketajaman langsung:
+        gain 0   -> baseline persis (delta dilewati)
+        gain 1   -> perilaku terlatih
+        gain <0  -> unsharp mask, secara prinsip LEBIH tajam dari baseline
+
+    Fungsi ini menjalankan inferensi untuk setiap gain lalu mencetak varians
+    Laplacian tiap kondisi berikut GT sebagai acuan, sehingga kamu langsung
+    mendapat kurva ketajaman-versus-gain dalam satu perintah.
+
+    PERINGATAN TAFSIR
+        Gain negatif memperkuat SELURUH komponen high-pass baseline — termasuk
+        artefak (pola herringbone pada citra gunung). Varians Laplacian akan
+        naik; belum tentu CLIPIQA/MUSIQ ikut naik. Jalankan `metrics` pada gain
+        terbaik sebelum menyimpulkan apa pun soal kualitas.
+    """
+    import shutil
+    from pathlib import Path
+
+    vol.reload()
+    cfg = _write_config(num_steps)
+    ckpt = f"{VOL}/experiments/fga_{mode}_{tag}/fga_{mode}_best.pth"
+    assert Path(ckpt).exists(), f"checkpoint tidak ada: {ckpt}"
+
+    # Set evaluasi yang sama untuk semua gain
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    print(f"[sweep] {len(val_names)} gambar dari "
+          f"{len({_scene_of(n) for n in val_names})} scene", flush=True)
+    eval_lr = Path("/tmp/eval/lr")
+    eval_lr.mkdir(parents=True, exist_ok=True)
+    gt_dir = Path(f"{VOL}/eval/gt")
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    for n in val_names:
+        shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
+        shutil.copy(f"{VOL}/pairs/gt/{n}.png", gt_dir / f"{n}.png")
+
+    cf = f"_{color_fix}" if color_fix else ""
+    vals = [float(g.strip()) for g in gains.split(",")]
+    hasil = []
+
+    for g in vals:
+        name = f"{mode}_{tag}_s{num_steps}{cf}_{_gtag(g)}"
+        out = f"{VOL}/out/{name}"
+        if not (Path(out).exists() and list(Path(out).glob("*.png"))) or overwrite:
+            cmd = ["python", "inference_invsr.py",
+                   "-i", str(eval_lr), "-o", out,
+                   "--cfg_path", cfg, "-n", str(num_steps),
+                   "--sd_path", f"{VOL}/models",
+                   "--started_ckpt_path",
+                   f"{VOL}/weights/noise_predictor_sd_turbo_v5.pth",
+                   "--fga_mode", mode, "--fga_ckpt", ckpt, "--fga_gain", str(g)]
+            if color_fix:
+                cmd += ["--color_fix", color_fix]
+            _sh(*cmd)
+        else:
+            print(f"[sweep] {name} sudah ada, dilewati", flush=True)
+        hasil.append((g, name, _lap_var(out)))
+
+    gt = _lap_var(str(gt_dir))
+    base = next((v for g, _, v in hasil if g == 0.0), None)
+    vol.commit()
+
+    print("\n" + "=" * 64)
+    print(f"{'gain':>6}  {'var Laplacian':>14}  {'vs GT':>7}  {'vs gain=0':>10}")
+    print(f"{'GT':>6}  {gt:14.6f}  {'0%':>7}  {'':>10}")
+    for g, _, v in hasil:
+        vs_gt = f"{100 * (v / gt - 1):+.0f}%"
+        vs_b = f"{100 * (v / base - 1):+.0f}%" if base else "-"
+        print(f"{g:>6}  {v:14.6f}  {vs_gt:>7}  {vs_b:>10}")
+    print("=" * 64)
+    print("gain=0 adalah baseline persis. Cari gain dengan varians Laplacian")
+    print("terdekat ke GT, lalu jalankan `metrics` pada nama direktorinya.")
+    for g, name, _ in hasil:
+        print(f"  gain {g:>5} -> out/{name}")
 
 
 @app.function(image=image, volumes={VOL: vol}, timeout=600)
