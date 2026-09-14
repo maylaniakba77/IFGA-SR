@@ -29,34 +29,22 @@ All commands are run **from the repository root**.
 
 ## Phase 0 — Unblock the codebase
 
-Two defects currently prevent training from starting at all. Fix both before anything else.
+**No longer required.** Both fixes this phase described are committed on `master`:
 
-### 0a. Add the missing import
+- `fga_integration/patch_decoder.py` imports `FGAUpsample2D`
+- `sampler_invsr.py` loads `fga_ckpt`, with asserts on `mode`, on unexpected keys, and on
+  unpopulated `.fga.` keys
 
-`fga_integration/patch_decoder.py` calls `FGAUpsample2D(...)` but never imports it. Add at the
-top of the file:
-
-```python
-from fga_integration.fga_upsampler import FGAUpsample2D
-```
-
-Without this, `train_fga.py` raises `NameError` immediately on startup.
-
-### 0b. Ensure the packages are importable
-
-Create empty `__init__.py` files if they do not already exist:
-
-```bash
-touch fga/__init__.py fga/archs/__init__.py fga_integration/__init__.py
-```
-
-### 0c. Verify
+Verify in one command:
 
 ```bash
 python -c "from fga_integration.patch_decoder import inject_fga; print('OK')"
 ```
 
-**Expected:** `OK`. Do not proceed until this passes.
+> **Running on Modal instead?** [`MODAL.md`](MODAL.md) supersedes this runbook end-to-end and is
+> the maintained path: it has no session cap, gives explicit GPU selection (bf16 rather than the
+> T4 fp16 fallback), and keeps data and checkpoints on a persistent Volume. This file remains
+> accurate for a local or Colab run.
 
 ---
 
@@ -250,13 +238,25 @@ rm -rf experiments/smoke_partial experiments/smoke_full
 
 ## Phase 6 — Train the `partial` variant
 
+> **The flags below differ from earlier revisions of this runbook, deliberately.** The original
+> recipe (`--w_pixel 1.0 --w_freq 0.1 --freq_mode full`, selecting by PSNR) was measured to
+> produce output **96% less sharp than the ground truth** — every term in it is a distance to GT,
+> and the distance-minimizing solution for this task is the blurry posterior mean. See
+> [`TRAINING.md`](TRAINING.md) §10 for the measurements and §6 for why each flag changed.
+>
+> Keep the old recipe only to reproduce the baseline-objective condition of the ablation.
+
+
 ```bash
 python fga_integration/train_fga.py \
   --data_dir data/cache/steps1 \
   --mode partial \
-  --iters 20000 --batch 1 --accum 8 \
+  --iters 20000 --batch 1 --accum 8 --crop 256 \
+  --split_by scene --val_scenes 20 \
   --lr 1e-4 --amp bf16 --seed 123456 \
-  --w_pixel 1.0 --w_freq 0.1 --freq_mode full \
+  --w_pixel 0.02 --w_freq 0.0 --freq_mode magnitude --freq_cutoff 0.5 \
+  --w_lpips 0.1 --lpips_net vgg --w_sharp 10.0 --sharp_ratio 2.0 --w_range 1.0 \
+  --w_gan 1.0 --gan_start 50 --select_by sharp \
   --out_dir experiments/fga_partial
 ```
 
@@ -303,9 +303,12 @@ Identical command with two changes only: `--mode` and `--out_dir`.
 python fga_integration/train_fga.py \
   --data_dir data/cache/steps1 \
   --mode full \
-  --iters 20000 --batch 1 --accum 8 \
+  --iters 20000 --batch 1 --accum 8 --crop 256 \
+  --split_by scene --val_scenes 20 \
   --lr 1e-4 --amp bf16 --seed 123456 \
-  --w_pixel 1.0 --w_freq 0.1 --freq_mode full \
+  --w_pixel 0.02 --w_freq 0.0 --freq_mode magnitude --freq_cutoff 0.5 \
+  --w_lpips 0.1 --lpips_net vgg --w_sharp 10.0 --sharp_ratio 2.0 --w_range 1.0 \
+  --w_gan 1.0 --gan_start 50 --select_by sharp \
   --out_dir experiments/fga_full
 ```
 

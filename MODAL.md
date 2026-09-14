@@ -150,7 +150,7 @@ Sudah masuk daftar `pip_install` di `modal_train.py`; jangan hapus.
 
 | Fase | Perintah | GPU |
 |---|---|---|
-| 1 | `modal run modal_train.py::prepare` | — |
+| 1 | `modal run modal_train.py::prepare --source lsdir --n 5000 --tag lsdir` | — |
 | 2 | `modal run modal_train.py::make_pairs` | T4 |
 | 3-4 | `modal run modal_train.py::cache` | L4 |
 | GATE 1b | `modal run modal_train.py::gate_roundtrip` | L4 |
@@ -160,14 +160,19 @@ Sudah masuk daftar `pip_install` di `modal_train.py`; jangan hapus.
 | 8 | `modal run modal_train.py::infer` | L4 |
 | GATE 3 | `modal run modal_train.py::gate_diff` | — |
 | 9 | `modal run modal_train.py::metrics` | L4 |
+| — | `modal run modal_train.py::sharpness --names a,b,c` | — |
+| — | `modal run modal_train.py::sweep_gain --mode full --tag v3` | L4 |
 
 Semua state ada di Volume `ifga-sr`:
 
+Dengan `--data-tag`, direktori data mendapat sufiks (`pairs_ffhq`, `cache_lsdir`);
+tag kosong memakai nama tanpa sufiks seperti di bawah.
+
 ```
 /vol/
-├── source_hr/                citra HR DIV2K
-├── pairs/{lr,gt}/            pasangan hasil degradasi Real-ESRGAN
-├── cache/steps1/{latent,gt}/ keluaran cache_latents.py
+├── source_hr[_tag]/          citra HR sumber (DIV2K / LSDIR / FFHQ)
+├── pairs[_tag]/{lr,gt}/      pasangan hasil degradasi Real-ESRGAN
+├── cache[_tag]/steps1/       keluaran cache_latents.py
 ├── configs/                  modal-sd-turbo.yaml (dibuat otomatis)
 ├── weights/                  noise_predictor_sd_turbo_v5.pth
 ├── models/                   cache HF (sd-turbo)
@@ -180,16 +185,43 @@ Semua state ada di Volume `ifga-sr`:
 
 ## 5. Fase 1 — Citra HR sumber
 
+Naskah tesis (Bab 2.4.3) menetapkan data pelatihan **subset LSDIR + 20.000 wajah
+FFHQ** mengikuti protokol resmi InvSR. DIV2K bukan bagian protokol itu — ia jalur
+cepat untuk pengembangan saja.
+
+| `--source` | Isi | Catatan |
+|---|---|---|
+| `lsdir` | LSDIR via HuggingFace | sesuai protokol InvSR |
+| `ffhq` | FFHQ 512x512 via HuggingFace | 70.000 tersedia; resolusinya cocok persis dengan `--gt-size 512` |
+| `div2k_valid` | 100 citra | pengembangan cepat |
+| `div2k_train` | 800 citra | pengembangan |
+
 ```bash
-modal run modal_train.py::prepare
+modal run modal_train.py::prepare --source ffhq --n 5000 --tag ffhq
 ```
 
-Default `valid` = 100 citra / 449 MB. Untuk run yang dilaporkan pakai `train`
-(800 citra / 3.5 GB):
+```bash
+modal run modal_train.py::prepare --source lsdir --n 5000 --tag lsdir
+```
+
+LSDIR dan FFHQ diunduh **streaming**, jadi mengambil 5.000 citra tidak memaksa
+mengunduh 27 GB penuh. Citra di bawah 512 px dilewati otomatis. `--tag`
+memisahkan direktori (`/vol/source_hr_ffhq`) sehingga beberapa dataset bisa hidup
+berdampingan; tag kosong menunjuk path lama sehingga data yang ada tetap utuh.
+
+### `--data-tag` di seluruh pipeline
+
+`make_pairs`, `cache`, `train`, `infer`, dan `sharpness` menerima `--data-tag`
+yang memilih dataset:
 
 ```bash
-modal run modal_train.py::prepare --dataset train
+modal run modal_train.py::make_pairs --gt-size 512 --draws 4 --data-tag ffhq
+modal run modal_train.py::cache --num-steps 1 --data-tag ffhq
+modal run --detach modal_train.py::train --mode full --data-tag ffhq --tag v4
 ```
+
+Yang mahal bukan unduhannya melainkan **caching latent** — ia menjalankan backbone
+InvSR penuh sekali per citra: sekitar 2 jam untuk 5.000 citra, 7 jam untuk 20.000.
 
 Idempoten: kalau `/vol/source_hr` sudah berisi PNG, ia langsung keluar.
 
@@ -491,6 +523,53 @@ kecil.
 > **Syarat ablasi.** `batch`, `accum`, dan GPU harus **identik** antara `partial`
 > dan `full`. Melatih satu varian di A100 batch 4 dan satunya di L4 batch 1
 > membuat perbandingan H3 terkonfound, meski batch efektifnya sama.
+
+### Objective ketajaman dan adversarial
+
+Tiga kelompok flag yang ditambahkan setelah pengukuran menunjukkan objective
+fidelitas justru menghasilkan penghalusan (lihat [`TRAINING.md`](TRAINING.md) §10):
+
+| Flag | Default | Fungsi |
+|---|---|---|
+| `--w-sharp` | 0.0 | loss ketajaman **satu arah** — satu-satunya term yang dapat meminta keluaran lebih tajam dari baseline |
+| `--sharp-ratio` | 1.0 | target ketajaman sebagai kelipatan GT; `1.0` setara foto asli, `> 1.0` melampauinya |
+| `--w-range` | 1.0 | hukuman piksel di luar `[-1,1]`. **Wajib > 0 bila `--w-sharp > 0`** |
+| `--w-gan` | 0.0 | PatchGAN spectral-norm; `0` = discriminator tidak dibuat |
+| `--d-lr` / `--d-base` | 1e-4 / 64 | learning rate dan lebar discriminator |
+| `--gan-start` | 1000 | step sebelum sinyal adversarial diaktifkan |
+| `--select-by sharp` | — | pilih checkpoint dengan `lap_ratio` terdekat ke target |
+
+Konfigurasi yang terukur menghasilkan **+38% lebih tajam dari baseline** pada
+`gain 1.0`:
+
+```bash
+modal run --detach modal_train.py::train --mode full \
+  --split-by scene --val-scenes 20 \
+  --w-sharp 10.0 --sharp-ratio 2.0 --w-range 1.0 \
+  --w-gan 1.0 --gan-start 50 \
+  --w-pixel 0.02 --w-lpips 0.1 --lpips-net vgg --w-freq 0.0 \
+  --select-by sharp --tag v3
+```
+
+**`--lpips-net vgg`, bukan `alex`.** Keduanya terukur bergerak berlawanan arah
+pada checkpoint yang sama: alex membaik sementara VGG memburuk. Alex kurang
+sensitif terhadap blur, jadi mengoptimasinya bisa dipuaskan oleh penghalusan.
+
+### Gain — kendali ketajaman saat inferensi
+
+`gain` menskala cabang residual FGA **tanpa training ulang**. `0` = baseline
+persis, `1` = perilaku terlatih, negatif = unsharp mask.
+
+```bash
+modal run modal_train.py::infer --fga-mode full --tag v3 --gain=-1.0
+```
+
+```bash
+modal run modal_train.py::sweep_gain --mode full --tag v3 --gains "-1,-0.5,0,1"
+```
+
+Pakai `--gain=-1.0` dengan tanda sama dengan; dipisah spasi, CLI membaca `-1.0`
+sebagai nama opsi.
 
 ### Flag yang tersedia di `train`
 

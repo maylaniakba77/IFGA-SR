@@ -86,6 +86,9 @@ _base = (
         # --w_lpips > 0 dan --select_by lpips
         "lpips",
     )
+    # Streaming dataset HuggingFace (LSDIR, FFHQ). Lapisan terpisah supaya
+    # penambahannya tidak membatalkan cache lapisan torch di bawahnya.
+    .pip_install("datasets")
     .env({
         # src/ HARUS mendahului agar diffusers yang di-vendor tidak ter-shadow
         "PYTHONPATH": f"{REPO}:{REPO}/src",
@@ -142,13 +145,29 @@ def _sh(*cmd: str) -> None:
     subprocess.run(list(cmd), cwd=REPO, check=True)
 
 
+# Sumber data yang dikenali. Naskah tesis (Bab 2.4.3) menetapkan pelatihan
+# memakai subset LSDIR + 20.000 wajah FFHQ mengikuti protokol resmi InvSR;
+# DIV2K dipertahankan sebagai jalur cepat untuk pengembangan.
+SOURCES = {
+    "div2k_valid": ("div2k", None, "DIV2K validation, 100 citra"),
+    "div2k_train": ("div2k", None, "DIV2K train, 800 citra"),
+    "lsdir":       ("lsdir", "danjacobellis/LSDIR", "LSDIR (protokol InvSR)"),
+    "ffhq":        ("ffhq", "Ryan-sjtu/ffhq512-caption", "FFHQ 512x512 (protokol InvSR)"),
+}
+
+
+def _dir(base: str, tag: str) -> str:
+    """Path per-dataset. tag kosong = path lama, supaya data yang ada tetap utuh."""
+    return f"{VOL}/{base}" + (f"_{tag}" if tag else "")
+
+
 def _scene_of(name: str) -> str:
     return name.split("_d")[0]
 
 
 def _eval_names(split_from: int, scenes: str = "", split_by: str = "scene",
                 val_scenes: int = 8, val_size: int = 32,
-                per_scene: int = 0) -> list:
+                per_scene: int = 0, data_tag: str = "") -> list:
     """Tentukan daftar gambar evaluasi. SATU sumber kebenaran untuk semua fungsi.
 
     `scenes`  daftar scene eksplisit dipisah koma, mis. "0801,0802,0803,0804".
@@ -161,8 +180,8 @@ def _eval_names(split_from: int, scenes: str = "", split_by: str = "scene",
     """
     from pathlib import Path as _P
     names = sorted(q.stem for q in
-                   _P(f"{VOL}/cache/steps{split_from}/latent").glob("*.npy"))
-    assert names, f"tidak ada cache di steps{split_from}"
+                   _P(f"{_dir('cache', data_tag)}/steps{split_from}/latent").glob("*.npy"))
+    assert names, f"tidak ada cache di {_dir('cache', data_tag)}/steps{split_from}"
 
     if scenes:
         want = {x.strip() for x in scenes.split(",")}
@@ -276,31 +295,55 @@ def _write_config(num_steps: int) -> str:
 # --------------------------------------------------------------------------- #
 # Fase 1 — citra HR sumber
 # --------------------------------------------------------------------------- #
-@app.function(image=image, volumes={VOL: vol}, timeout=3600)
-def prepare(dataset: str = "valid"):
-    """Unduh DIV2K HR ke Volume. 'valid'=100 citra/449MB, 'train'=800/3.5GB.
+@app.function(image=image, volumes={VOL: vol}, timeout=6 * 3600)
+def prepare(source: str = "div2k_valid", n: int = 0, tag: str = ""):
+    """Siapkan citra HR sumber.
 
-    Unduhan memakai `requests`, BUKAN wget: debian_slim tidak memuat wget, dan
-    menambahkannya ke apt_install akan membatalkan cache lapisan pip di atasnya
-    sehingga torch (~2,5 GB) ikut ter-build ulang. requests sudah ada di image.
+    `source` salah satu kunci SOURCES. `n` membatasi jumlah citra (0 = semua).
+    `tag` memisahkan direktori supaya beberapa dataset bisa hidup berdampingan;
+    kosong = path lama `/vol/source_hr`.
 
-    Ekstraksi menulis PNG LANGSUNG ke Volume. Jangan tergoda mengekstrak ke /tmp
-    lalu os.rename ke Volume: keduanya filesystem berbeda, jadi rename gagal
-    dengan `OSError: [Errno 18] Invalid cross-device link`.
+    LSDIR dan FFHQ diunduh secara STREAMING dari HuggingFace, jadi hanya shard
+    yang benar-benar dibutuhkan yang ditarik — mengambil 20.000 wajah dari FFHQ
+    tidak memaksa mengunduh seluruh 27 GB.
     """
+    import os
+
+    assert source in SOURCES, f"source tidak dikenal: {source}. Pilihan: {list(SOURCES)}"
+    kind, repo, desc = SOURCES[source]
+    src = _dir("source_hr", tag)
+    os.makedirs(src, exist_ok=True)
+    # Hitung HANYA berkas milik sumber ini. Berkas dinamai `<kind>_<idx>.png`,
+    # jadi menghitung seluruh direktori akan membuat pemanggilan kedua terlewati
+    # saat MENGGABUNG dua dataset ke satu tag — mis. `--source lsdir --n 5000`
+    # lalu `--source ffhq --n 5000` akan melihat 5000 berkas LSDIR, menyangka
+    # kuotanya sudah terpenuhi, dan diam-diam menghasilkan dataset tanpa FFHQ.
+    ada = [f for f in os.listdir(src) if f.startswith(f"{kind}_") and f.endswith(".png")]
+    lain = len([f for f in os.listdir(src) if f.endswith(".png")]) - len(ada)
+    if ada and (not n or len(ada) >= n):
+        print(f"{len(ada)} citra {kind} sudah ada di {src} — dilewati")
+        return
+    if lain:
+        print(f"[prepare] {lain} citra dari sumber lain sudah ada di {src}; "
+              f"{kind} akan DITAMBAHKAN (mode gabung)", flush=True)
+    print(f"[prepare] {desc} -> {src}", flush=True)
+
+    if kind == "div2k":
+        _prepare_div2k(src, "valid" if source.endswith("valid") else "train")
+    else:
+        _prepare_hf(src, repo, n or 20000, kind)
+
+    vol.commit()
+    print(f"[prepare] selesai: {len([f for f in os.listdir(src) if f.endswith('.png')])} citra")
+
+
+def _prepare_div2k(src: str, split: str) -> None:
     import os
     import zipfile
 
     import requests
 
-    src = f"{VOL}/source_hr"
-    os.makedirs(src, exist_ok=True)
-    ada = [f for f in os.listdir(src) if f.lower().endswith(".png")]
-    if ada:
-        print(f"{len(ada)} citra sudah ada di {src} — dilewati")
-        return
-
-    url = f"https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_{dataset}_HR.zip"
+    url = f"https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_{split}_HR.zip"
     zp = "/tmp/div2k.zip"
     print(f"mengunduh {url}", flush=True)
     with requests.get(url, stream=True, timeout=(30, 300)) as r:
@@ -314,11 +357,8 @@ def prepare(dataset: str = "valid"):
                 if done >= next_log:
                     print(f"  {done / 1e9:.2f} GB"
                           f"{f' / {total / 1e9:.2f} GB' if total else ''}", flush=True)
-                    next_log = done + (1 << 27)  # tiap ~134 MB
-    # content-length yang tidak cocok = unduhan terpotong; zipfile akan gagal
-    # dengan pesan yang membingungkan, jadi tangkap di sini.
+                    next_log = done + (1 << 27)
     assert not total or done == total, f"unduhan terpotong: {done}/{total} byte"
-    print(f"selesai: {done / 1e9:.2f} GB", flush=True)
 
     n = 0
     with zipfile.ZipFile(zp) as z:
@@ -328,17 +368,41 @@ def prepare(dataset: str = "valid"):
             with z.open(member) as fsrc, open(f"{src}/{os.path.basename(member)}", "wb") as fdst:
                 fdst.write(fsrc.read())
             n += 1
-    assert n, "zip terekstrak tetapi tidak ada PNG di dalamnya"
+    assert n, "zip terekstrak tetapi tidak ada PNG"
     os.remove(zp)
-    vol.commit()
-    print(f"{n} citra HR -> {src}")
+
+
+def _prepare_hf(src: str, repo: str, n: int, kind: str) -> None:
+    """Streaming dari HuggingFace, simpan sebagai PNG.
+
+    Citra lebih kecil dari 512 px dilewati: make_pairs memakai --gt_size 512
+    dengan random crop, dan citra yang lebih kecil akan diabaikan di sana juga.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(repo, split="train", streaming=True)
+    kept = 0
+    for i, ex in enumerate(ds):
+        if kept >= n:
+            break
+        im = ex.get("image")
+        if im is None:
+            continue
+        if min(im.size) < 512:
+            continue
+        im.convert("RGB").save(f"{src}/{kind}_{kept:06d}.png")
+        kept += 1
+        if kept % 500 == 0:
+            print(f"  {kept}/{n} citra (dari {i + 1} sampel)", flush=True)
+            vol.commit()
 
 
 # --------------------------------------------------------------------------- #
 # Fase 2 — pasangan LR/GT
 # --------------------------------------------------------------------------- #
 @app.function(image=image, gpu=GPU_CHEAP, volumes={VOL: vol}, timeout=6 * 3600)
-def make_pairs(gt_size: int = 512, draws: int = 4, limit: int = 0):
+def make_pairs(gt_size: int = 512, draws: int = 4, limit: int = 0,
+               data_tag: str = ""):
     """Sintesis LR memakai degradasi Real-ESRGAN milik repo ini.
 
     gt_size 512 (bukan 256 seperti notebook) supaya --crop 256 saat training
@@ -346,7 +410,7 @@ def make_pairs(gt_size: int = 512, draws: int = 4, limit: int = 0):
     """
     vol.reload()
     cmd = ["python", "fga_integration/make_pairs.py",
-           "--hr_dir", f"{VOL}/source_hr", "--out_dir", f"{VOL}/pairs",
+           "--hr_dir", _dir("source_hr", data_tag), "--out_dir", _dir("pairs", data_tag),
            "--gt_size", str(gt_size), "--draws", str(draws)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -358,14 +422,15 @@ def make_pairs(gt_size: int = 512, draws: int = 4, limit: int = 0):
 # Fase 3-4 — cache latent
 # --------------------------------------------------------------------------- #
 @app.function(image=image, gpu=GPU_CACHE, volumes={VOL: vol}, timeout=12 * 3600)
-def cache(num_steps: int = 1, limit: int = 0):
+def cache(num_steps: int = 1, limit: int = 0, data_tag: str = ""):
     """Jalankan backbone InvSR yang dibekukan sekali, simpan latent + GT."""
     vol.reload()
     cfg = _write_config(num_steps)
     cmd = ["python", "fga_integration/cache_latents.py",
            "--cfg_path", cfg,
-           "--lr_dir", f"{VOL}/pairs/lr", "--gt_dir", f"{VOL}/pairs/gt",
-           "--out_dir", f"{VOL}/cache/steps{num_steps}",
+           "--lr_dir", f"{_dir('pairs', data_tag)}/lr",
+           "--gt_dir", f"{_dir('pairs', data_tag)}/gt",
+           "--out_dir", f"{_dir('cache', data_tag)}/steps{num_steps}",
            "--num_steps", str(num_steps)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -449,6 +514,7 @@ def train(
     log_every: int = 50,
     val_every: int = 500,
     tag: str = "mag",
+    data_tag: str = "",
     overwrite: bool = False,
 ):
     """Latih modul FGA. Default di sini adalah konfigurasi yang MENDORONG ketajaman.
@@ -465,7 +531,7 @@ def train(
                  "pakai --tag <nama lain>")
 
     _sh("python", "fga_integration/train_fga.py",
-        "--data_dir", f"{VOL}/cache/steps{num_steps}",
+        "--data_dir", f"{_dir('cache', data_tag)}/steps{num_steps}",
         "--mode", mode,
         "--iters", str(iters), "--batch", str(batch), "--accum", str(accum),
         "--crop", str(crop), "--inner_dim", str(inner_dim),
@@ -491,7 +557,8 @@ def train(
 
 @app.function(image=image, volumes={VOL: vol}, timeout=1800)
 def sharpness(names: str, scenes: str = "", split_from: int = 1,
-              split_by: str = "scene", val_scenes: int = 8, per_scene: int = 0):
+              split_by: str = "scene", val_scenes: int = 8, per_scene: int = 0,
+              data_tag: str = ""):
     """Bandingkan ketajaman beberapa direktori keluaran terhadap GT.
 
     Metriknya varians Laplacian: kontras lokal absolut. Ini yang dipakai sebagai
@@ -512,7 +579,8 @@ def sharpness(names: str, scenes: str = "", split_from: int = 1,
     import os
 
     vol.reload()
-    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32,
+                            per_scene, data_tag)
     n_sc = len({_scene_of(n) for n in val_names})
     print(f"[sharpness] {len(val_names)} gambar dari {n_sc} scene\n")
 
@@ -657,7 +725,8 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
 def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
           color_fix: str = "", split_from: int = 1, out_name: str = "",
           gain: float = 1.0, scenes: str = "", split_by: str = "scene",
-          val_scenes: int = 8, per_scene: int = 0, overwrite: bool = False):
+          val_scenes: int = 8, per_scene: int = 0, data_tag: str = "",
+          overwrite: bool = False):
     """Jalankan inferensi pada split validasi (yang tidak pernah dilihat FGA).
 
     `num_steps`  jadwal sampling yang DIPAKAI saat inferensi.
@@ -687,7 +756,8 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     cfg = _write_config(num_steps)
 
     # Rekonstruksi split val LatentHRDataset: val_size nama pertama (tersortir)
-    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32,
+                            per_scene, data_tag)
     n_sc = len({_scene_of(n) for n in val_names})
     print(f"[infer] set evaluasi: {len(val_names)} gambar dari {n_sc} scene"
           + (f" (scene eksplisit: {scenes})" if scenes else f" (split_by={split_by})"),
@@ -796,8 +866,8 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
     gt_dir = Path(f"{VOL}/eval/gt")
     gt_dir.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
-        shutil.copy(f"{VOL}/pairs/gt/{n}.png", gt_dir / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/lr/{n}.png", eval_lr / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/gt/{n}.png", gt_dir / f"{n}.png")
 
     cf = f"_{color_fix}" if color_fix else ""
     vals = [float(g.strip()) for g in gains.split(",")]
