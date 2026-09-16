@@ -439,7 +439,7 @@ def cache(num_steps: int = 1, limit: int = 0, data_tag: str = ""):
 
 
 @app.function(image=image, gpu=GPU_CACHE, volumes={VOL: vol}, timeout=1800)
-def gate_roundtrip(num_steps: int = 1):
+def gate_roundtrip(num_steps: int = 1, data_tag: str = ""):
     """GATE 1b — konvensi scaling latent.
 
     cache_latents.py menyimpan latent MENTAH; train_fga.py membaginya dengan
@@ -454,7 +454,7 @@ def gate_roundtrip(num_steps: int = 1):
     from diffusers import AutoencoderKL
 
     vol.reload()
-    lat_dir = Path(f"{VOL}/cache/steps{num_steps}/latent")
+    lat_dir = Path(f"{_dir('cache', data_tag)}/steps{num_steps}/latent")
     paths = sorted(lat_dir.glob("*.npy"))
     assert paths, f"tidak ada latent di {lat_dir} -- jalankan `cache` lebih dulu"
 
@@ -606,7 +606,8 @@ def sharpness(names: str, scenes: str = "", split_from: int = 1,
 
 
 @app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=1800)
-def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
+def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4,
+          data_tag: str = ""):
     """GATE 2 — verifikasi keempat kriteria lulus secara langsung, tanpa training.
 
     Kriteria 3 ("loss step 0 setara baseline") tidak bisa dibaca dari log
@@ -634,7 +635,7 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
     from fga_integration.patch_decoder import inject_fga
 
     vol.reload()
-    root = Path(f"{VOL}/cache/steps{num_steps}")
+    root = Path(f"{_dir('cache', data_tag)}/steps{num_steps}")
     names = sorted(p.stem for p in (root / "latent").glob("*.npy"))[:n]
     assert names, f"cache kosong di {root} — jalankan `cache` lebih dulu"
     print(f"[gate2] menguji {len(names)} sampel dari {root}\n")
@@ -773,7 +774,7 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     eval_lr = Path("/tmp/eval/lr")
     eval_lr.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/lr/{n}.png", eval_lr / f"{n}.png")
 
     # color_fix masuk ke nama: tanpa ini, run polos dan run wavelet pada mode dan
     # rezim step yang sama akan bertabrakan di direktori yang sama.
@@ -807,7 +808,7 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     gt_dir = Path(f"{VOL}/eval/gt")
     gt_dir.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/gt/{n}.png", gt_dir / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/gt/{n}.png", gt_dir / f"{n}.png")
     vol.commit()
 
 
@@ -829,7 +830,7 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
                split_from: int = 1, color_fix: str = "",
                gains: str = "-1,-0.5,0,0.5,1", scenes: str = "",
                split_by: str = "scene", val_scenes: int = 8,
-               per_scene: int = 0, overwrite: bool = False):
+               per_scene: int = 0, data_tag: str = "", overwrite: bool = False):
     """Sapu gain cabang residual FGA pada SATU checkpoint, tanpa training ulang.
 
     Modul terlatih terbukti mempelajari operator high-pass yang mengurangkan
@@ -854,11 +855,12 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
 
     vol.reload()
     cfg = _write_config(num_steps)
-    ckpt = f"{VOL}/experiments/fga_{mode}_{tag}/fga_{mode}_best.pth"
+    ckpt = f"{VOL}/experiments/fga_{mode}_{tag}/fga_{mode}_best.pth"  # noqa: E501
     assert Path(ckpt).exists(), f"checkpoint tidak ada: {ckpt}"
 
     # Set evaluasi yang sama untuk semua gain
-    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32,
+                            per_scene, data_tag)
     print(f"[sweep] {len(val_names)} gambar dari "
           f"{len({_scene_of(n) for n in val_names})} scene", flush=True)
     eval_lr = Path("/tmp/eval/lr")
