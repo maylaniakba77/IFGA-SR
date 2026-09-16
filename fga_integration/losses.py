@@ -156,10 +156,39 @@ def _lap_energy(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return lap[..., 2:-2, 2:-2].flatten(1).pow(2).mean(dim=1) + eps
 
 
+def _chroma_lap_energy(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Energi Laplacian pada komponen CHROMA (simpangan tiap kanal dari luma)."""
+    lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    ch = x - lum                                    # (B, 3, H, W)
+    b, c, h, w = ch.shape
+    lap = F.conv2d(ch.reshape(b * c, 1, h, w), _LAP_TRAIN.to(ch.device, ch.dtype))
+    return lap[..., 2:-2, 2:-2].reshape(b, c, -1).pow(2).mean(dim=(1, 2)) + eps
+
+
+def chroma_excess_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Hukum energi frekuensi tinggi CHROMA yang MELEBIHI milik GT.
+
+    MENGAPA INI WAJIB BILA `--w_sharp` AKTIF
+        `sharpness_deficit_loss` mengukur Laplacian pada LUMINANSI saja, dan
+        luminansi adalah jumlah berbobot ketiga kanal. Akibatnya, menambahkan
+        noise per-kanal yang tidak berkorelasi adalah cara yang tersedia untuk
+        menaikkan kontras luma — dan chroma meledak sebagai efek samping.
+
+        Terukur pada run `full_v4`: ketajaman luma naik hanya 22% dari baseline
+        sementara energi Laplacian chroma naik 627%. Rasio chroma/luma bergerak
+        dari 0.086 (wajar untuk foto natural) ke 0.509. Itulah noise berwarna
+        dan bercak merah yang muncul di keluaran.
+
+    Satu arah: chroma yang lebih tenang dari GT tidak dihukum, hanya kelebihannya.
+    """
+    return F.relu(_chroma_lap_energy(pred) / _chroma_lap_energy(target) - 1.0).mean()
+
+
 def sharpness_deficit_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     ratio: float = 1.0,
+    over: float = 0.25,
 ) -> torch.Tensor:
     """Hukum HANYA bila `pred` KURANG tajam dari `ratio` x ketajaman GT.
 
@@ -189,7 +218,18 @@ def sharpness_deficit_loss(
     dampingi dengan `--w_gan` > 0, yang menuntut teksturnya terlihat nyata,
     dan verifikasi dengan CLIPIQA/MUSIQ.
     """
-    return F.relu(ratio - _lap_energy(pred) / _lap_energy(target)).mean()
+    r = _lap_energy(pred) / _lap_energy(target)
+    deficit = F.relu(ratio - r)
+    if over <= 0:
+        return deficit.mean()
+    # Sisi kelebihan, dibobot `over` (default 1/4 dari sisi kekurangan).
+    #
+    # Versi murni satu arah memberi NOL gradien begitu targetnya terlampaui,
+    # sehingga tidak ada yang menahan model di target maupun mencegah lonjakan.
+    # Terukur pada `full_v4`: lap_ratio mencapai 47.2 pada step 500 sebelum
+    # loss lain menariknya turun secara perlahan. Asimetrinya dipertahankan —
+    # mempertajam tetap jauh lebih murah daripada menghaluskan.
+    return (deficit + over * F.relu(r - ratio)).mean()
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +256,9 @@ class FGALoss(nn.Module):
         w_lpips: float = 0.0,
         w_sharp: float = 0.0,
         sharp_ratio: float = 1.0,
+        sharp_over: float = 0.25,
         w_range: float = 1.0,
+        w_chroma: float = 1.0,
         freq_mode: str = "full",
         freq_cutoff: float = 0.25,
         lpips_net: str = "alex",
@@ -232,7 +274,9 @@ class FGALoss(nn.Module):
         self.w_lpips = w_lpips
         self.w_sharp = w_sharp
         self.sharp_ratio = sharp_ratio
+        self.sharp_over = sharp_over
         self.w_range = w_range
+        self.w_chroma = w_chroma
         self.freq_mode = freq_mode
         self.freq_cutoff = freq_cutoff
 
@@ -281,9 +325,15 @@ class FGALoss(nn.Module):
         }
 
         if self.w_sharp > 0:
-            l_sharp = sharpness_deficit_loss(pred, target, self.sharp_ratio)
+            l_sharp = sharpness_deficit_loss(pred, target, self.sharp_ratio,
+                                             self.sharp_over)
             total = total + self.w_sharp * l_sharp
             parts["loss_sharp"] = float(l_sharp.detach())
+
+        if self.w_chroma > 0:
+            l_chroma = chroma_excess_loss(pred, target)
+            total = total + self.w_chroma * l_chroma
+            parts["loss_chroma"] = float(l_chroma.detach())
 
         if self.w_range > 0:
             # Hukum nilai piksel di luar [-1, 1].

@@ -239,6 +239,14 @@ def main():
     ap.add_argument("--w_sharp", type=float, default=0.0,
                     help="bobot loss ketajaman satu arah. Ini SATU-SATUNYA term "
                          "yang dapat meminta keluaran lebih tajam dari baseline")
+    ap.add_argument("--sharp_over", type=float, default=0.25,
+                    help="bobot sisi KELEBIHAN pada loss ketajaman, relatif "
+                         "terhadap sisi kekurangan. 0 = murni satu arah, yang "
+                         "membiarkan lap_ratio melonjak tanpa batas")
+    ap.add_argument("--w_chroma", type=float, default=1.0,
+                    help="hukuman energi frekuensi tinggi CHROMA di atas GT. "
+                         "Jaga > 0 bila --w_sharp > 0: loss ketajaman hanya "
+                         "mengukur luminansi, sehingga chroma tak terkendali")
     ap.add_argument("--w_range", type=float, default=1.0,
                     help="hukuman untuk piksel di luar [-1,1]. Jaga > 0 bila "
                          "--w_sharp > 0, kalau tidak akan muncul bintik warna "
@@ -251,8 +259,12 @@ def main():
     ap.add_argument("--w_gan", type=float, default=0.0,
                     help="bobot loss adversarial. 0 = nonaktif (discriminator "
                          "tidak dibuat). Nilai wajar untuk SR: 0.02-0.1")
-    ap.add_argument("--d_lr", type=float, default=1e-4,
-                    help="learning rate discriminator")
+    ap.add_argument("--d_lr", type=float, default=4e-4,
+                    help="learning rate discriminator. Default 4x lr generator "
+                         "(two-timescale update rule): pada d_lr=1e-4, loss_gan_d "
+                         "terukur hanya bergerak dari 2.0 ke 1.87 setelah 10.000 "
+                         "step — discriminator praktis tidak belajar dan term "
+                         "adversarialnya menjadi inert")
     ap.add_argument("--d_base", type=int, default=64, help="lebar dasar PatchGAN")
     ap.add_argument("--gan_start", type=int, default=1000,
                     help="step sebelum GAN diaktifkan. FGA di-zero-init, jadi "
@@ -344,7 +356,9 @@ def main():
         w_lpips=args.w_lpips,
         w_sharp=args.w_sharp,
         sharp_ratio=args.sharp_ratio,
+        sharp_over=args.sharp_over,
         w_range=args.w_range,
+        w_chroma=args.w_chroma,
         freq_mode=args.freq_mode,
         freq_cutoff=args.freq_cutoff,
         lpips_net=args.lpips_net,
@@ -487,6 +501,13 @@ def main():
                 msg += f" lpips={m['lpips']:.4f}"
             msg += f" lap_ratio={m['lap_ratio']:.3f}"
             print(msg)
+            # Hinge loss discriminator berawal di 2.0. Kalau ia menempel di sana,
+            # D tidak memisahkan asli dari palsu dan sinyal adversarialnya nol —
+            # penjaga yang seharusnya menolak tekstur tidak natural sedang tidur.
+            d_now = acc.get("loss_gan_d")
+            if d_now is not None and d_now > 1.8 and step > args.gan_start + 500:
+                print(f"    -> PERINGATAN: loss_gan_d={d_now:.3f} masih dekat 2.0; "
+                      "discriminator tidak belajar. Naikkan --d_lr.")
             # Deviasi dari TARGET ketajaman, bukan dari GT. Bila --w_sharp aktif,
             # targetnya adalah --sharp_ratio; kalau tidak, GT (1.0). Tanpa ini,
             # --select_by sharp akan memilih checkpoint yang menyamai GT padahal
