@@ -149,23 +149,50 @@ def spectral_magnitude_loss(
 _LAP_TRAIN = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).view(1, 1, 3, 3)
 
 
-def _lap_energy(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Energi Laplacian per citra (bisa dibackprop). x: (B,3,H,W) di [-1,1]."""
-    lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
-    lap = F.conv2d(lum, _LAP_TRAIN.to(lum.device, lum.dtype))
-    return lap[..., 2:-2, 2:-2].flatten(1).pow(2).mean(dim=1) + eps
+def _pool(sq: torch.Tensor, patch: int) -> torch.Tensor:
+    """Rata-ratakan peta Laplacian kuadrat per patch, atau seluruh citra bila patch=0.
+
+    MENGAPA PER-PATCH
+        Statistik tingkat-gambar dapat dipenuhi dengan MELEDAKKAN beberapa area
+        alih-alih menajamkan merata — keduanya memberi rata-rata yang sama, dan
+        tidak ada yang mengatur di mana energinya ditaruh.
+
+        Terukur pada `full_v3`: kelebihan chroma menggumpal di blok 32x32
+        tertentu hingga +0.060 sementara rata-rata seluruh citra justru -0.003
+        (lebih bersih dari baseline). Rasio puncak terhadap rata-rata bermedian
+        13.674x. Itulah "bercak hitam dan merah" yang terlihat — bukan noise
+        merata, melainkan beberapa area yang meledak.
+
+        Dengan penalti dihitung per patch lalu dirata-ratakan, satu blok yang
+        meledak tidak bisa lagi disembunyikan di balik rata-rata gambar.
+    """
+    if patch and sq.shape[-1] >= patch and sq.shape[-2] >= patch:
+        return F.avg_pool2d(sq, patch, stride=patch).flatten(1)
+    return sq.flatten(1).mean(dim=1, keepdim=True)
 
 
-def _chroma_lap_energy(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Energi Laplacian pada komponen CHROMA (simpangan tiap kanal dari luma)."""
+def _lap_energy(x: torch.Tensor, eps: float = 1e-8, patch: int = 0) -> torch.Tensor:
+    """Energi Laplacian luminansi, per patch. x: (B,3,H,W) di [-1,1]."""
     lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
-    ch = x - lum                                    # (B, 3, H, W)
+    lap = F.conv2d(lum, _LAP_TRAIN.to(lum.device, lum.dtype))[..., 2:-2, 2:-2]
+    return _pool(lap.pow(2), patch) + eps
+
+
+def _chroma_lap_energy(x: torch.Tensor, eps: float = 1e-8,
+                       patch: int = 0) -> torch.Tensor:
+    """Energi Laplacian CHROMA (simpangan tiap kanal dari luma), per patch."""
+    lum = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    ch = x - lum
     b, c, h, w = ch.shape
-    lap = F.conv2d(ch.reshape(b * c, 1, h, w), _LAP_TRAIN.to(ch.device, ch.dtype))
-    return lap[..., 2:-2, 2:-2].reshape(b, c, -1).pow(2).mean(dim=(1, 2)) + eps
+    lap = F.conv2d(ch.reshape(b * c, 1, h, w),
+                   _LAP_TRAIN.to(ch.device, ch.dtype))[..., 2:-2, 2:-2]
+    # rata-ratakan ketiga kanal dulu, baru pool spasial
+    sq = lap.pow(2).reshape(b, c, 1, *lap.shape[-2:]).mean(dim=1)
+    return _pool(sq, patch) + eps
 
 
-def chroma_excess_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def chroma_excess_loss(pred: torch.Tensor, target: torch.Tensor,
+                       patch: int = 32) -> torch.Tensor:
     """Hukum energi frekuensi tinggi CHROMA yang MELEBIHI milik GT.
 
     MENGAPA INI WAJIB BILA `--w_sharp` AKTIF
@@ -181,7 +208,8 @@ def chroma_excess_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
 
     Satu arah: chroma yang lebih tenang dari GT tidak dihukum, hanya kelebihannya.
     """
-    return F.relu(_chroma_lap_energy(pred) / _chroma_lap_energy(target) - 1.0).mean()
+    return F.relu(_chroma_lap_energy(pred, patch=patch)
+                  / _chroma_lap_energy(target, patch=patch) - 1.0).mean()
 
 
 def sharpness_deficit_loss(
@@ -189,6 +217,7 @@ def sharpness_deficit_loss(
     target: torch.Tensor,
     ratio: float = 1.0,
     over: float = 0.25,
+    patch: int = 32,
 ) -> torch.Tensor:
     """Hukum HANYA bila `pred` KURANG tajam dari `ratio` x ketajaman GT.
 
@@ -218,7 +247,7 @@ def sharpness_deficit_loss(
     dampingi dengan `--w_gan` > 0, yang menuntut teksturnya terlihat nyata,
     dan verifikasi dengan CLIPIQA/MUSIQ.
     """
-    r = _lap_energy(pred) / _lap_energy(target)
+    r = _lap_energy(pred, patch=patch) / _lap_energy(target, patch=patch)
     deficit = F.relu(ratio - r)
     if over <= 0:
         return deficit.mean()
@@ -257,6 +286,7 @@ class FGALoss(nn.Module):
         w_sharp: float = 0.0,
         sharp_ratio: float = 1.0,
         sharp_over: float = 0.25,
+        sharp_patch: int = 32,
         w_range: float = 1.0,
         w_chroma: float = 1.0,
         freq_mode: str = "full",
@@ -275,6 +305,7 @@ class FGALoss(nn.Module):
         self.w_sharp = w_sharp
         self.sharp_ratio = sharp_ratio
         self.sharp_over = sharp_over
+        self.sharp_patch = sharp_patch
         self.w_range = w_range
         self.w_chroma = w_chroma
         self.freq_mode = freq_mode
@@ -326,12 +357,12 @@ class FGALoss(nn.Module):
 
         if self.w_sharp > 0:
             l_sharp = sharpness_deficit_loss(pred, target, self.sharp_ratio,
-                                             self.sharp_over)
+                                             self.sharp_over, self.sharp_patch)
             total = total + self.w_sharp * l_sharp
             parts["loss_sharp"] = float(l_sharp.detach())
 
         if self.w_chroma > 0:
-            l_chroma = chroma_excess_loss(pred, target)
+            l_chroma = chroma_excess_loss(pred, target, self.sharp_patch)
             total = total + self.w_chroma * l_chroma
             parts["loss_chroma"] = float(l_chroma.detach())
 

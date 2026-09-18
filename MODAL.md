@@ -8,6 +8,9 @@ dipetakan ke fase bernama di dokumen itu.
 Seluruh perintah dijalankan dari **root repositori** di mesin lokalmu. Yang
 berjalan di GPU adalah [`modal_train.py`](modal_train.py).
 
+> Riwayat lengkap konfigurasi yang sudah dijalankan beserta hasil terukurnya ada
+> di [`EXPERIMENTS.md`](EXPERIMENTS.md).
+
 ---
 
 ## Contents

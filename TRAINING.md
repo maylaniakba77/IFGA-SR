@@ -505,6 +505,9 @@ image sets.
 
 ## 10. Measured Findings
 
+> Per-run commands, configurations, and results are catalogued in
+> [`EXPERIMENTS.md`](EXPERIMENTS.md).
+
 All figures below come from held-out scenes, with every condition evaluated on identical images.
 
 **The module converges to a smoothing operator under distance objectives.** Correlation between

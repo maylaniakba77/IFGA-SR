@@ -243,6 +243,11 @@ def main():
                     help="bobot sisi KELEBIHAN pada loss ketajaman, relatif "
                          "terhadap sisi kekurangan. 0 = murni satu arah, yang "
                          "membiarkan lap_ratio melonjak tanpa batas")
+    ap.add_argument("--sharp_patch", type=int, default=32,
+                    help="ukuran patch untuk statistik ketajaman & chroma. "
+                         "0 = statistik seluruh gambar, yang dapat dipenuhi "
+                         "dengan meledakkan beberapa area saja alih-alih "
+                         "menajamkan merata")
     ap.add_argument("--w_chroma", type=float, default=1.0,
                     help="hukuman energi frekuensi tinggi CHROMA di atas GT. "
                          "Jaga > 0 bila --w_sharp > 0: loss ketajaman hanya "
@@ -357,6 +362,7 @@ def main():
         w_sharp=args.w_sharp,
         sharp_ratio=args.sharp_ratio,
         sharp_over=args.sharp_over,
+        sharp_patch=args.sharp_patch,
         w_range=args.w_range,
         w_chroma=args.w_chroma,
         freq_mode=args.freq_mode,
