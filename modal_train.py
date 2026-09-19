@@ -129,13 +129,18 @@ def _sh(*cmd: str) -> None:
     subprocess.run(list(cmd), cwd=REPO, check=True)
 
 
+def _dir(base: str, tag: str) -> str:
+    """Path per-dataset. tag kosong = path lama, supaya data DIV2K tetap utuh."""
+    return f"{VOL}/{base}" + (f"_{tag}" if tag else "")
+
+
 def _scene_of(name: str) -> str:
     return name.split("_d")[0]
 
 
 def _eval_names(split_from: int, scenes: str = "", split_by: str = "scene",
                 val_scenes: int = 8, val_size: int = 32,
-                per_scene: int = 0) -> list:
+                per_scene: int = 0, data_tag: str = "") -> list:
     """Tentukan daftar gambar evaluasi. SATU sumber kebenaran untuk semua fungsi.
 
     `scenes`  daftar scene eksplisit dipisah koma, mis. "0801,0802,0803,0804".
@@ -148,7 +153,7 @@ def _eval_names(split_from: int, scenes: str = "", split_by: str = "scene",
     """
     from pathlib import Path as _P
     names = sorted(q.stem for q in
-                   _P(f"{VOL}/cache/steps{split_from}/latent").glob("*.npy"))
+                   _P(f"{_dir('cache', data_tag)}/steps{split_from}/latent").glob("*.npy"))
     assert names, f"tidak ada cache di steps{split_from}"
 
     if scenes:
@@ -345,14 +350,15 @@ def make_pairs(gt_size: int = 512, draws: int = 4, limit: int = 0):
 # Fase 3-4 — cache latent
 # --------------------------------------------------------------------------- #
 @app.function(image=image, gpu=GPU_CACHE, volumes={VOL: vol}, timeout=12 * 3600)
-def cache(num_steps: int = 1, limit: int = 0):
+def cache(num_steps: int = 1, limit: int = 0, data_tag: str = ""):
     """Jalankan backbone InvSR yang dibekukan sekali, simpan latent + GT."""
     vol.reload()
     cfg = _write_config(num_steps)
     cmd = ["python", "fga_integration/cache_latents.py",
            "--cfg_path", cfg,
-           "--lr_dir", f"{VOL}/pairs/lr", "--gt_dir", f"{VOL}/pairs/gt",
-           "--out_dir", f"{VOL}/cache/steps{num_steps}",
+           "--lr_dir", f"{_dir('pairs', data_tag)}/lr",
+           "--gt_dir", f"{_dir('pairs', data_tag)}/gt",
+           "--out_dir", f"{_dir('cache', data_tag)}/steps{num_steps}",
            "--num_steps", str(num_steps)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -361,7 +367,7 @@ def cache(num_steps: int = 1, limit: int = 0):
 
 
 @app.function(image=image, gpu=GPU_CACHE, volumes={VOL: vol}, timeout=1800)
-def gate_roundtrip(num_steps: int = 1):
+def gate_roundtrip(num_steps: int = 1, data_tag: str = ""):
     """GATE 1b — konvensi scaling latent.
 
     cache_latents.py menyimpan latent MENTAH; train_fga.py membaginya dengan
@@ -376,7 +382,7 @@ def gate_roundtrip(num_steps: int = 1):
     from diffusers import AutoencoderKL
 
     vol.reload()
-    lat_dir = Path(f"{VOL}/cache/steps{num_steps}/latent")
+    lat_dir = Path(f"{_dir('cache', data_tag)}/steps{num_steps}/latent")
     paths = sorted(lat_dir.glob("*.npy"))
     assert paths, f"tidak ada latent di {lat_dir} -- jalankan `cache` lebih dulu"
 
@@ -422,6 +428,7 @@ def train(
     d_base: int = 64,
     gan_start: int = 1000,
     select_by: str = "lpips",
+    data_tag: str = "",
     inner_dim: int = 64,
     lr: float = 1e-4,
     warmup: int = 500,
@@ -451,7 +458,7 @@ def train(
                  "pakai --tag <nama lain>")
 
     _sh("python", "fga_integration/train_fga.py",
-        "--data_dir", f"{VOL}/cache/steps{num_steps}",
+        "--data_dir", f"{_dir('cache', data_tag)}/steps{num_steps}",
         "--mode", mode,
         "--iters", str(iters), "--batch", str(batch), "--accum", str(accum),
         "--crop", str(crop), "--inner_dim", str(inner_dim),
@@ -475,7 +482,8 @@ def train(
 
 
 @app.function(image=image, gpu=GPU_TRAIN, volumes={VOL: vol}, timeout=1800)
-def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
+def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4,
+          data_tag: str = ""):
     """GATE 2 — verifikasi keempat kriteria lulus secara langsung, tanpa training.
 
     Kriteria 3 ("loss step 0 setara baseline") tidak bisa dibaca dari log
@@ -503,7 +511,7 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
     from fga_integration.patch_decoder import inject_fga
 
     vol.reload()
-    root = Path(f"{VOL}/cache/steps{num_steps}")
+    root = Path(f"{_dir('cache', data_tag)}/steps{num_steps}")
     names = sorted(p.stem for p in (root / "latent").glob("*.npy"))[:n]
     assert names, f"cache kosong di {root} — jalankan `cache` lebih dulu"
     print(f"[gate2] menguji {len(names)} sampel dari {root}\n")
@@ -594,7 +602,8 @@ def gate2(num_steps: int = 1, inner_dim: int = 64, n: int = 4):
 def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
           color_fix: str = "", split_from: int = 1, out_name: str = "",
           gain: float = 1.0, scenes: str = "", split_by: str = "scene",
-          val_scenes: int = 8, per_scene: int = 0, overwrite: bool = False):
+          val_scenes: int = 8, per_scene: int = 0, data_tag: str = "",
+          overwrite: bool = False):
     """Jalankan inferensi pada split validasi (yang tidak pernah dilihat FGA).
 
     `num_steps`  jadwal sampling yang DIPAKAI saat inferensi.
@@ -624,7 +633,7 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     cfg = _write_config(num_steps)
 
     # Rekonstruksi split val LatentHRDataset: val_size nama pertama (tersortir)
-    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene, data_tag)
     n_sc = len({_scene_of(n) for n in val_names})
     print(f"[infer] set evaluasi: {len(val_names)} gambar dari {n_sc} scene"
           + (f" (scene eksplisit: {scenes})" if scenes else f" (split_by={split_by})"),
@@ -640,7 +649,7 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     eval_lr = Path("/tmp/eval/lr")
     eval_lr.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/lr/{n}.png", eval_lr / f"{n}.png")
 
     # color_fix masuk ke nama: tanpa ini, run polos dan run wavelet pada mode dan
     # rezim step yang sama akan bertabrakan di direktori yang sama.
@@ -674,7 +683,7 @@ def infer(fga_mode: str = "none", tag: str = "mag", num_steps: int = 1,
     gt_dir = Path(f"{VOL}/eval/gt")
     gt_dir.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/gt/{n}.png", gt_dir / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/gt/{n}.png", gt_dir / f"{n}.png")
     vol.commit()
 
 
@@ -696,7 +705,7 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
                split_from: int = 1, color_fix: str = "",
                gains: str = "-1,-0.5,0,0.5,1", scenes: str = "",
                split_by: str = "scene", val_scenes: int = 8,
-               per_scene: int = 0, overwrite: bool = False):
+               per_scene: int = 0, data_tag: str = "", overwrite: bool = False):
     """Sapu gain cabang residual FGA pada SATU checkpoint, tanpa training ulang.
 
     Modul terlatih terbukti mempelajari operator high-pass yang mengurangkan
@@ -725,7 +734,7 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
     assert Path(ckpt).exists(), f"checkpoint tidak ada: {ckpt}"
 
     # Set evaluasi yang sama untuk semua gain
-    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene)
+    val_names = _eval_names(split_from, scenes, split_by, val_scenes, 32, per_scene, data_tag)
     print(f"[sweep] {len(val_names)} gambar dari "
           f"{len({_scene_of(n) for n in val_names})} scene", flush=True)
     eval_lr = Path("/tmp/eval/lr")
@@ -733,8 +742,8 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
     gt_dir = Path(f"{VOL}/eval/gt")
     gt_dir.mkdir(parents=True, exist_ok=True)
     for n in val_names:
-        shutil.copy(f"{VOL}/pairs/lr/{n}.png", eval_lr / f"{n}.png")
-        shutil.copy(f"{VOL}/pairs/gt/{n}.png", gt_dir / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/lr/{n}.png", eval_lr / f"{n}.png")
+        shutil.copy(f"{_dir('pairs', data_tag)}/gt/{n}.png", gt_dir / f"{n}.png")
 
     cf = f"_{color_fix}" if color_fix else ""
     vals = [float(g.strip()) for g in gains.split(",")]
