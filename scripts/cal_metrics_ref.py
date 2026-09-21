@@ -64,8 +64,58 @@ if args.maniqa:
     maniqa_metric = pyiqa.create_metric('maniqa')
 if args.pi:
     pi_metric = pyiqa.create_metric('pi')
-loss_fn_vgg = lpips.LPIPS(net='vgg').cuda()
-loss_fn_alex = lpips.LPIPS(net='alex').cuda()
+# Perangkat dipilih otomatis supaya skrip ini jalan di luar mesin ber-CUDA.
+# `--tocpu` yang sudah ada hanya memindahkan CLIPIQA dan MUSIQ; LPIPS dan tensor
+# datanya tetap menuntut CUDA, sehingga di mesin tanpa GPU NVIDIA skrip gagal
+# sebelum sempat menghitung apa pun.
+#
+# MPS (Apple Silicon) tidak default: dukungan operator pada lpips dan pyiqa
+# belum lengkap dan gagalnya senyap. Paksakan dengan IFGA_DEVICE=mps.
+DEV = os.environ.get("IFGA_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[metrics] perangkat: {DEV}")
+
+
+def frc_bands(sr, gt, eps=1e-12):
+    """Fourier Ring Correlation antara batch SR dan GT.
+
+    Mengembalikan (AUC, pita_rendah, pita_menengah, pita_tinggi).
+
+    MENGAPA METRIK INI ADA
+        PSNR dan SSIM didominasi komponen frekuensi rendah — spektrum citra
+        natural meluruh ~1/f, sehingga kesalahan pada detail halus nyaris tidak
+        memengaruhi keduanya. FRC menghitung korelasi per cincin frekuensi
+        dengan bobot SAMA tiap cincin, jadi ia langsung menjawab pertanyaan
+        penelitian ini: sampai frekuensi berapa rekonstruksi tetap setia.
+
+        FRC(q) = Re[ sum F_sr * conj(F_gt) ] / sqrt( sum|F_sr|^2 * sum|F_gt|^2 )
+
+        Rentang [-1, 1]. DC dilewati karena selalu berkorelasi sempurna.
+        Pita 'tinggi' yang paling relevan untuk rekonstruksi detail.
+    """
+    lum = lambda x: 0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]
+    A = torch.fft.fft2(lum(sr).double())
+    B = torch.fft.fft2(lum(gt).double())
+    h, w = A.shape[-2:]
+    fy = torch.fft.fftfreq(h, device=A.device) * h
+    fx = torch.fft.fftfreq(w, device=A.device) * w
+    ring = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).long().flatten()
+    qmax = min(h, w) // 2
+    nb = int(ring.max().item()) + 1
+
+    def acc(v):                                    # jumlahkan per cincin
+        out = torch.zeros(v.shape[0], nb, dtype=v.dtype, device=v.device)
+        return out.index_add_(1, ring, v.flatten(1))
+
+    num, d1, d2 = acc((A * B.conj()).real), acc(A.abs() ** 2), acc(B.abs() ** 2)
+    curve = num[:, 1:qmax + 1] / (torch.sqrt(d1[:, 1:qmax + 1] * d2[:, 1:qmax + 1]) + eps)
+
+    f = torch.arange(1, qmax + 1, device=curve.device).double() / qmax
+    band = lambda lo, hi: curve[:, (f >= lo) & (f < hi)].mean().item()
+    return (curve.mean().item(), band(0, 1 / 3), band(1 / 3, 2 / 3), band(2 / 3, 1.001))
+
+
+loss_fn_vgg = lpips.LPIPS(net='vgg').to(DEV)
+loss_fn_alex = lpips.LPIPS(net='alex').to(DEV)
 if args.tocpu:
     clipiqa_metric = pyiqa.create_metric('clipiqa').to('cpu')
     musiq_metric = pyiqa.create_metric('musiq').to('cpu')
@@ -100,6 +150,10 @@ metrics = {
         'LPIPS_ALEX': 0,
         'CLIPIQA': 0,
         'MUSIQ': 0,
+        'FRC_AUC': 0,
+        'FRC_LOW': 0,
+        'FRC_MID': 0,
+        'FRC_HIGH': 0,
         }
 if args.niqe:
     metrics['NIQE'] = 0
@@ -110,8 +164,8 @@ if args.maniqa:
 if args.pi:
     metrics['PI'] = 0
 for ii, data in enumerate(dataloader):
-    im_sr = data['image'].cuda()  # N x h x w x 3, [0,1]
-    im_gt = data['gt'].cuda()     # N x h x w x 3, [0,1]
+    im_sr = data['image'].to(DEV)  # N x h x w x 3, [0,1]
+    im_gt = data['gt'].to(DEV)     # N x h x w x 3, [0,1]
     current_bs = im_sr.shape[0]
 
     if not (im_sr.shape == im_gt.shape):
@@ -130,6 +184,7 @@ for ii, data in enumerate(dataloader):
             (im_gt - 0.5) / 0.5,
             (im_sr - 0.5) / 0.5,
             ).mean().item()
+    current_frc, current_frc_lo, current_frc_mid, current_frc_hi = frc_bands(im_sr, im_gt)
     if args.tocpu:
         current_clipiqa = clipiqa_metric(im_sr.cpu()).mean().item()
         current_musiq = musiq_metric(im_sr.cpu()).mean().item()
@@ -163,6 +218,10 @@ for ii, data in enumerate(dataloader):
     metrics['LPIPS_ALEX'] += current_lpips_alex * current_bs
     metrics['CLIPIQA'] += current_clipiqa * current_bs
     metrics['MUSIQ'] += current_musiq * current_bs
+    metrics['FRC_AUC'] += current_frc * current_bs
+    metrics['FRC_LOW'] += current_frc_lo * current_bs
+    metrics['FRC_MID'] += current_frc_mid * current_bs
+    metrics['FRC_HIGH'] += current_frc_hi * current_bs
     if args.niqe:
         metrics['NIQE'] += current_niqe * current_bs
     if args.dists:
@@ -184,6 +243,10 @@ logger.info(f"MEAN LPIPS(VGG): {metrics['LPIPS_VGG']:6.4f}")
 logger.info(f"MEAN LPIPS(ALEX): {metrics['LPIPS_ALEX']:6.4f}")
 logger.info(f"MEAN CLIPIQA: {metrics['CLIPIQA']:6.4f}")
 logger.info(f"MEAN MUSIQ: {metrics['MUSIQ']:6.4f}")
+logger.info(f"MEAN FRC-AUC: {metrics['FRC_AUC']:6.4f}")
+logger.info(f"MEAN FRC rendah: {metrics['FRC_LOW']:6.4f}")
+logger.info(f"MEAN FRC menengah: {metrics['FRC_MID']:6.4f}")
+logger.info(f"MEAN FRC tinggi: {metrics['FRC_HIGH']:6.4f}")
 if args.fid:
     logger.info(f"MEAN FID: {metrics['FID']:6.2f}")
 if args.niqe:
