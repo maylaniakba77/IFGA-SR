@@ -104,8 +104,19 @@ def _with_repo(img: modal.Image) -> modal.Image:
     """
     return img.add_local_dir(
         ".", REPO,
-        ignore=["**/.git", "**/__pycache__", "**/*.pyc", "assets/**",
-                "testdata/**", "notebooks/**", "data/**", "experiments/**"],
+        # Abaikan setiap artefak data. Terukur di branch ini: tanpa pola-pola
+        # berikut, satu `modal run` mengunggah 41.854 berkas / 1,76 GB — 40.000
+        # di antaranya citra LR yang container tidak pernah baca. Unggahan
+        # sebesar itu juga penyebab umum "SSL connection is closed" pada
+        # koneksi yang kurang stabil.
+        #
+        # Tidak ada citra di repo yang diperlukan saat runtime: aset demo ada di
+        # assets/ dan testdata/, keduanya sudah diabaikan.
+        ignore=["**/.git", "**/__pycache__", "**/*.pyc",
+                "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp", "**/*.bmp",
+                "**/*.npy", "**/*.pth", "**/*.log", "**/*.zip", "**/*.docx",
+                "assets/**", "testdata/**", "notebooks/**",
+                "data/**", "experiments/**", "out/**", "gt/**", "lr/**"],
     )
 
 
@@ -789,7 +800,7 @@ def sweep_gain(mode: str = "partial", tag: str = "v2", num_steps: int = 1,
 
 
 @app.function(image=image, volumes={VOL: vol}, timeout=600)
-def gate_diff(tags: str = "partial_mag,full_mag"):
+def gate_diff(tags: str = "partial_mag,full_mag", baseline: str = "baseline"):
     """GATE 3 — keluaran varian HARUS berbeda dari baseline.
 
     Nilai 0.0 berarti bobot FGA tidak sampai ke model, dan seluruh metrik
@@ -801,7 +812,7 @@ def gate_diff(tags: str = "partial_mag,full_mag"):
     from PIL import Image
 
     vol.reload()
-    base_dir = f"{VOL}/out/baseline"
+    base_dir = f"{VOL}/out/{baseline}"
     base = sorted(os.listdir(base_dir))
     assert base, "baseline belum dijalankan"
 
