@@ -1,0 +1,59 @@
+[4050/10000] lr=6.93e-05 | loss_pixel=0.14275 | loss_freq=0.03432 | loss_lpips=0.41447 | loss_total=0.91184 | 45.5 mnt
+[4100/10000] lr=6.86e-05 | loss_pixel=0.12263 | loss_freq=0.03000 | loss_lpips=0.39583 | loss_total=0.86391 | 46.0 mnt
+[4150/10000] lr=6.78e-05 | loss_pixel=0.15520 | loss_freq=0.05339 | loss_lpips=0.40093 | loss_total=0.92416 | 46.6 mnt
+Traceback (most recent call last):
+  File "/repo/fga_integration/train_fga.py", line 529, in <module>
+    main()
+  File "/repo/fga_integration/train_fga.py", line 425, in main
+    latent, gt = next(stream)
+  File "/repo/fga_integration/train_fga.py", line 165, in infinite
+    for batch in loader:
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 630, in __next__
+    data = self._next_data()
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1344, in _next_data
+    return self._process_data(data)
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1370, in _process_data
+    data.reraise()
+  File "/usr/local/lib/python3.10/site-packages/torch/_utils.py", line 706, in reraise
+    raise exception
+ValueError: Caught ValueError in DataLoader worker process 1.
+Original Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", line 309, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/usr/local/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/repo/fga_integration/train_fga.py", line 153, in __getitem__
+    gt = np.load(self.root / "gt" / f"{name}.npy").astype(np.float32)
+  File "/usr/local/lib/python3.10/site-packages/numpy/lib/_npyio_impl.py", line 480, in load
+    return format.read_array(fid, allow_pickle=allow_pickle,
+  File "/usr/local/lib/python3.10/site-packages/numpy/lib/format.py", line 859, in read_array
+    array.shape = shape
+ValueError: cannot reshape array of size 325632 into shape (3,512,512)
+
+Traceback (most recent call last):
+  File "/pkg/modal/_runtime/container_io_manager.py", line 987, in handle_input_exception
+    yield
+  File "/pkg/modal/_container_entrypoint.py", line 189, in run_input_sync
+    values = io_context.call_function_sync()
+  File "/pkg/modal/_runtime/container_io_manager.py", line 266, in call_function_sync
+    expected_value_or_values = self.finalized_function.callable(*args, **kwargs)
+  File "/root/modal_train.py", line 533, in train
+    _sh("python", "fga_integration/train_fga.py",
+  File "/root/modal_train.py", line 143, in _sh
+    subprocess.run(list(cmd), cwd=REPO, check=True)
+  File "/usr/local/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['python', 'fga_integration/train_fga.py', '--data_dir', '/vol/cache_mix/steps3', '--mode', 'full', '--iters', '10000', '--batch', '1', '--accum', '4', '--crop', '256', '--inner_dim', '64', '--lr', '0.0001', '--warmup', '500', '--weight_decay', '0.01', '--grad_clip', '1.0', '--amp', 'bf16', '--seed', '123456', '--val_size', '32', '--split_by', 'scene', '--val_scenes', '20', '--pixel_type', 'l1', '--w_pixel', '0.1', '--w_freq', '2.0', '--freq_mode', 'magnitude', '--freq_cutoff', '0.5', '--w_lpips', '2.0', '--lpips_net', 'vgg', '--w_sharp', '0.0', '--sharp_ratio', '1.0', '--w_gan', '0.0', '--d_lr', '0.0001', '--d_base', '64', '--gan_start', '1000', '--select_by', 'lpips', '--val_every', '500', '--save_every', '500', '--log_every', '50', '--out_dir', '/vol/experiments/fga_full_v2.1s3']' returned non-zero exit status 1.
+
+╭─ Error ───────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Command '['python', 'fga_integration/train_fga.py', '--data_dir', '/vol/cache_mix/steps3', '--mode', 'full',          │
+│ '--iters', '10000', '--batch', '1', '--accum', '4', '--crop', '256', '--inner_dim', '64', '--lr', '0.0001',           │
+│ '--warmup', '500', '--weight_decay', '0.01', '--grad_clip', '1.0', '--amp', 'bf16', '--seed', '123456', '--val_size', │
+│ '32', '--split_by', 'scene', '--val_scenes', '20', '--pixel_type', 'l1', '--w_pixel', '0.1', '--w_freq', '2.0',       │
+│ '--freq_mode', 'magnitude', '--freq_cutoff', '0.5', '--w_lpips', '2.0', '--lpips_net', 'vgg', '--w_sharp', '0.0',     │
+│ '--sharp_ratio', '1.0', '--w_gan', '0.0', '--d_lr', '0.0001', '--d_base', '64', '--gan_start', '1000', '--select_by', │
+│ 'lpips', '--val_every', '500', '--save_every', '500', '--log_every', '50', '--out_dir',                               │
+│ '/vol/experiments/fga_full_v2.1s3']' returned non-zero exit status 1.                                                 │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
