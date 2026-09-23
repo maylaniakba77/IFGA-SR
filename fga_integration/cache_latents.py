@@ -34,6 +34,7 @@ CATATAN VERIFIKASI
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,37 @@ from omegaconf import OmegaConf
 # Modul milik repositori InvSR (jalankan skrip ini dari root repo InvSR)
 from sampler_invsr import BaseSampler, _positive, _negative
 from utils import util_image
+
+
+def _save_atomic(path: Path, arr: np.ndarray) -> None:
+    """Tulis .npy lewat berkas sementara lalu rename.
+
+    `np.save` tidak atomik: proses yang terbunuh di tengah penulisan
+    meninggalkan berkas terpotong yang header-nya sah tetapi datanya kurang,
+    sehingga baru meledak jauh kemudian saat training — `ValueError: cannot
+    reshape array of size N into shape (...)`. Rename pada filesystem yang sama
+    bersifat atomik, jadi berkas hanya pernah terlihat utuh atau tidak ada.
+    """
+    tmp = path.with_suffix(".npy.tmp")
+    np.save(tmp, arr)
+    os.replace(tmp, path)
+
+
+def _complete(path: Path) -> bool:
+    """True bila .npy ada DAN ukurannya sesuai header-nya.
+
+    Berkas terpotong tetap punya header yang sah — hanya datanya yang kurang.
+    Karena itu `exists()` saja tidak cukup untuk memutuskan boleh dilewati.
+    """
+    try:
+        with open(path, "rb") as f:
+            version = np.lib.format.read_magic(f)
+            shape, _, dtype = np.lib.format._read_array_header(f, version)
+            header_end = f.tell()
+        expected = header_end + int(np.prod(shape)) * dtype.itemsize
+        return path.stat().st_size >= expected
+    except Exception:
+        return False
 
 
 class LatentCacher(BaseSampler):
@@ -79,8 +111,15 @@ class LatentCacher(BaseSampler):
                 continue
 
             out_lat = out_dir / "latent" / f"{lr_path.stem}.npy"
-            if out_lat.exists():
-                continue  # sudah pernah di-cache, aman untuk resume
+            out_gt = out_dir / "gt" / f"{lr_path.stem}.npy"
+            # Periksa KEDUANYA dan periksa keutuhannya, bukan sekadar exists().
+            # GT ditulis setelah latent, jadi interupsi di antara keduanya
+            # meninggalkan latent utuh dengan GT hilang/terpotong — dan versi
+            # lama melewatinya selamanya karena hanya melihat latent.
+            if _complete(out_lat) and _complete(out_gt):
+                continue
+            if out_lat.exists() or out_gt.exists():
+                print(f"[cache] memperbaiki cache rusak: {lr_path.stem}", flush=True)
 
             im_lr = util_image.imread(str(lr_path), chn="rgb", dtype="float32")
             im_lr = util_image.img2tensor(im_lr).cuda()  # (1, 3, h, w), [0, 1]
@@ -106,7 +145,7 @@ class LatentCacher(BaseSampler):
                         "Periksa apakah pipeline mendukung output_type='latent'."
                     )
 
-            np.save(out_lat, latent.squeeze(0).cpu().numpy().astype(np.float16))
+            _save_atomic(out_lat, latent.squeeze(0).cpu().numpy().astype(np.float16))
 
             # Simpan ground truth HR sebagai float16 agar loader ringan
             im_gt = util_image.imread(str(gt_path), chn="rgb", dtype="float32")
@@ -115,7 +154,7 @@ class LatentCacher(BaseSampler):
                 im_gt = F.interpolate(
                     im_gt[None], size=target_size, mode="bicubic", align_corners=False
                 ).squeeze(0).clamp(0, 1)
-            np.save(out_dir / "gt" / f"{lr_path.stem}.npy", im_gt.numpy().astype(np.float16))
+            _save_atomic(out_gt, im_gt.numpy().astype(np.float16))
 
             if (i + 1) % 200 == 0:
                 print(f"[cache] {i + 1}/{len(lr_paths)}")

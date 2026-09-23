@@ -435,8 +435,26 @@ def cache(num_steps: int = 1, limit: int = 0, data_tag: str = ""):
            "--num_steps", str(num_steps)]
     if limit:
         cmd += ["--limit", str(limit)]
-    _sh(*cmd)
+    # Commit BERKALA, bukan hanya di akhir.
+    #
+    # Caching 3 langkah untuk 40.000 pasang memakan 10-12 jam. Dengan satu
+    # commit di akhir, interupsi di jam kesembilan membuang seluruh pekerjaan:
+    # tulisan yang belum ter-commit tidak dijamin bertahan saat container mati.
+    # Commit tiap 5 menit membatasi kerugian maksimum menjadi 5 menit.
+    import subprocess
+    import time
+
+    print("+", " ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd, cwd=REPO)
+    last = time.time()
+    while proc.poll() is None:
+        time.sleep(10)
+        if time.time() - last > 300:
+            vol.commit()
+            last = time.time()
     vol.commit()
+    if proc.returncode != 0:
+        raise RuntimeError(f"cache_latents.py gagal (exit {proc.returncode})")
 
 
 @app.function(image=image, gpu=GPU_CACHE, volumes={VOL: vol}, timeout=1800)
