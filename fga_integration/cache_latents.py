@@ -56,8 +56,16 @@ def _save_atomic(path: Path, arr: np.ndarray) -> None:
     reshape array of size N into shape (...)`. Rename pada filesystem yang sama
     bersifat atomik, jadi berkas hanya pernah terlihat utuh atau tidak ada.
     """
-    tmp = path.with_suffix(".npy.tmp")
-    np.save(tmp, arr)
+    # Dua jebakan di sini:
+    #
+    # 1. `np.save(nama, ...)` MENAMBAHKAN ".npy" bila nama tidak berakhiran itu,
+    #    sehingga menulis ke berkas lain dari yang kita kira dan os.replace
+    #    kemudian gagal. Melewatkan OBJEK BERKAS mematikan perilaku tersebut.
+    # 2. Nama sementara tidak boleh berakhiran ".npy", kalau tidak ia akan ikut
+    #    terjaring glob("*.npy") dan dianggap sampel oleh dataset.
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        np.save(f, arr)
     os.replace(tmp, path)
 
 
@@ -100,6 +108,12 @@ class LatentCacher(BaseSampler):
         )
         if limit is not None:
             lr_paths = lr_paths[:limit]
+
+        # Sapu sisa berkas sementara dari run yang gagal sebelumnya.
+        for sub in ("latent", "gt"):
+            for junk in (out_dir / sub).glob("*.tmp*"):
+                junk.unlink()
+                print(f"[cache] membuang sisa sementara: {junk.name}", flush=True)
 
         timesteps = self.configs.timesteps[:num_steps]
         print(f"[cache] {len(lr_paths)} citra | num_steps={num_steps} | timesteps={timesteps}")
